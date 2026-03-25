@@ -18,8 +18,9 @@ export default function AuthForm({ onSuccess, requireAddress = true, adminSignUp
   const [showPrivacyAfterSignUp, setShowPrivacyAfterSignUp] = useState(false);
   const { signIn, signUp, signOut } = useAuth();
 
-  const userAppUrl = (import.meta.env.VITE_USER_APP_URL ?? '').trim() || '/';
-  const userAppOpensNewTab = /^https?:\/\//i.test(userAppUrl);
+  const userAppUrl = (import.meta.env.VITE_USER_APP_URL ?? '').trim();
+  // Show customer-site link only for https domains (avoid localhost links on production).
+  const userAppOpensNewTab = /^https:\/\//i.test(userAppUrl);
 
   const [formData, setFormData] = useState({
     login: '',
@@ -119,15 +120,15 @@ export default function AuthForm({ onSuccess, requireAddress = true, adminSignUp
           {adminSignUp && (
             <p className="mt-3 text-sm text-gray-400">
               Looking to order pizza?{' '}
-              <a
-                href={userAppUrl}
-                {...(userAppOpensNewTab
-                  ? { target: '_blank', rel: 'noopener noreferrer' }
-                  : {})}
-                className="text-yellow-400 hover:text-yellow-300 font-medium underline-offset-2 hover:underline"
-              >
-                Go to the customer site
-              </a>
+              {userAppOpensNewTab ? (
+                <a
+                  href={userAppUrl}
+                  {...{ target: '_blank', rel: 'noopener noreferrer' }}
+                  className="text-yellow-400 hover:text-yellow-300 font-medium underline-offset-2 hover:underline"
+                >
+                  Go to the customer site
+                </a>
+              ) : null}
             </p>
           )}
         </div>

@@ -4,8 +4,9 @@ import AuthForm from './components/AuthForm';
 import AdminOrderNotifications from './components/AdminOrderNotifications';
 import { LogOut, Home } from 'lucide-react';
 
-const userAppUrl = (import.meta.env.VITE_USER_APP_URL ?? '').trim() || '/';
-const userAppOpensNewTab = /^https?:\/\//i.test(userAppUrl);
+const userAppUrl = (import.meta.env.VITE_USER_APP_URL ?? '').trim();
+// Show cross-link only if the URL is an https domain (avoid localhost links on production).
+const userAppOpensNewTab = /^https:\/\//i.test(userAppUrl);
 
 function AdminContent() {
   const { user, adminProfile, signOut } = useAuth();
@@ -37,16 +38,16 @@ function AdminContent() {
               : "This page is for KaeDy's Pizza Hub administrators. Your account is a customer account."}
           </p>
           <div className="flex flex-col sm:flex-row gap-3 justify-center">
-            <a
-              href={userAppUrl}
-              {...(userAppOpensNewTab
-                ? { target: '_blank', rel: 'noopener noreferrer' }
-                : {})}
-              className="inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-yellow-400 text-black font-semibold hover:bg-yellow-300 transition-all"
-            >
-              <Home className="w-4 h-4" />
-              Go to main site
-            </a>
+            {userAppOpensNewTab ? (
+              <a
+                href={userAppUrl}
+                {...{ target: '_blank', rel: 'noopener noreferrer' }}
+                className="inline-flex items-center justify-center gap-2 px-4 py-3 rounded-lg bg-yellow-400 text-black font-semibold hover:bg-yellow-300 transition-all"
+              >
+                <Home className="w-4 h-4" />
+                Go to main site
+              </a>
+            ) : null}
             <button
               onClick={async () => {
                 await signOut();
