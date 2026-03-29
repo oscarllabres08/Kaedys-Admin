@@ -11,6 +11,7 @@ import {
   OrderItem,
   PaymentMethodSetting,
 } from '../lib/supabase';
+import { extractCustomerInstructionFromNotes } from '../lib/orderNotes';
 import { useAuth } from '../contexts/AuthContext';
 import {
   Pizza,
@@ -50,8 +51,6 @@ const STATUS_LABELS: { id: Order['status']; label: string }[] = [
 
 const ADMIN_TAB_STORAGE_KEY = 'kaedys_admin_active_tab';
 const WALLET_METHODS: PaymentMethodSetting['method'][] = ['GCash', 'Maya', 'PayPal'];
-const MAIN_CATEGORY_OPTIONS = ['Pizza', 'All Day Silog Meals', 'Chicken', 'Nasi Goreng', 'Drinks'];
-
 function toTitleCase(value: string) {
   return value
     .trim()
@@ -288,7 +287,7 @@ export default function AdminPage() {
   const [menuSearch, setMenuSearch] = useState('');
   const [menuCategory, setMenuCategory] = useState<string>('All');
   const [menuForm, setMenuForm] = useState({
-    category: 'Pizza',
+    category: '',
     custom_category: '',
     subcategory: '',
     name: '',
@@ -378,30 +377,17 @@ export default function AdminPage() {
     }
   }, [activeTab, isMasterAdmin]);
 
-  const formMainCategoryOptions = useMemo(
-    () => [...MAIN_CATEGORY_OPTIONS, 'Others'],
-    []
-  );
-
   const categoryOptions = useMemo(() => {
-    const preferred = MAIN_CATEGORY_OPTIONS;
     const set = new Set<string>();
-
     for (const item of menuItems) {
       const label =
         item.category === 'Others' ? item.custom_category?.trim() || 'Others' : item.category?.trim();
       if (label) set.add(label);
     }
-
-    const dynamic = [...set].filter((c) => !preferred.includes(c) && c !== 'Others').sort();
-    const orderedPreferred = preferred.filter((c) => set.has(c));
-    return [...orderedPreferred, ...dynamic];
+    return [...set].sort((a, b) => a.localeCompare(b));
   }, [menuItems]);
 
-  const filterCategoryOptions = useMemo(
-    () => categoryOptions.filter((c) => c !== 'Others'),
-    [categoryOptions]
-  );
+  const filterCategoryOptions = categoryOptions;
 
   const filteredMenuItems = useMemo(() => {
     const q = menuSearch.trim().toLowerCase();
@@ -571,6 +557,8 @@ export default function AdminPage() {
       if (error) throw error;
       await sendStatusEmail(order, status);
       await fetchOrders();
+      // DB trigger archives completed orders / updates archive flags — keep both lists in sync.
+      await fetchArchivedOrders();
     } catch (error) {
       console.error('Error updating order status', error);
     }
@@ -748,10 +736,8 @@ export default function AdminPage() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'orders' },
         () => {
-          // Only refresh when Orders tab is visible to avoid surprise jumps
-          if (activeTab === 'orders') {
+          if (activeTab === 'orders' || activeTab === 'archived') {
             fetchOrders();
-          } else if (activeTab === 'archived') {
             fetchArchivedOrders();
           }
         }
@@ -762,6 +748,12 @@ export default function AdminPage() {
       supabase.removeChannel(channel);
     };
   }, [activeTab, fetchOrders, fetchArchivedOrders]);
+
+  // Fresh archive list when opening the Archive tab (e.g. after completing orders on Orders).
+  useEffect(() => {
+    if (activeTab !== 'archived') return;
+    fetchArchivedOrders();
+  }, [activeTab, fetchArchivedOrders]);
 
   const createAnnouncement = async () => {
     if (!newAnnouncement.title || !newAnnouncement.content) return;
@@ -1275,8 +1267,8 @@ export default function AdminPage() {
   const handleSaveMenuItem = async () => {
     try {
       const price = Number(menuForm.price);
-      const normalizedCustomCategory = toTitleCase(menuForm.custom_category);
       const normalizedSubcategory = toTitleCase(menuForm.subcategory);
+      const normalizedCategory = toTitleCase(menuForm.category);
       if (!menuForm.name || !menuForm.description || !Number.isFinite(price)) {
         openNoticeModal('Missing fields', 'Please fill out name, description, and a valid price.', 'info');
         return;
@@ -1285,8 +1277,8 @@ export default function AdminPage() {
         openNoticeModal('Description too long', 'Description must be 100 characters or less.', 'info');
         return;
       }
-      if (menuForm.category === 'Others' && !normalizedCustomCategory) {
-        openNoticeModal('Missing category', 'Please enter a custom category.', 'info');
+      if (!normalizedCategory) {
+        openNoticeModal('Missing category', 'Please enter a main category.', 'info');
         return;
       }
 
@@ -1313,8 +1305,8 @@ export default function AdminPage() {
         name: menuForm.name,
         description: menuForm.description.trim(),
         price,
-        category: menuForm.category,
-        custom_category: menuForm.category === 'Others' ? normalizedCustomCategory : null,
+        category: normalizedCategory,
+        custom_category: null,
         subcategory: normalizedSubcategory || null,
         image_url: imageUrl,
       };
@@ -1727,29 +1719,15 @@ export default function AdminPage() {
               <div className="p-4 space-y-3">
                 <div>
                   <label className="block text-sm font-medium text-gray-200 mb-1">Main category</label>
-                  <select
+                  <input
+                    type="text"
                     value={menuForm.category}
                     onChange={(e) => setMenuForm((p) => ({ ...p, category: e.target.value }))}
                     className="w-full px-3 py-2 rounded-lg bg-black text-white border border-yellow-500/30"
-                  >
-                    {formMainCategoryOptions.map((c) => (
-                      <option key={c} value={c}>
-                        {c}
-                      </option>
-                    ))}
-                  </select>
+                    placeholder="e.g. Pizza, Drinks, Silog Meals"
+                    autoComplete="off"
+                  />
                 </div>
-                {menuForm.category === 'Others' && (
-                  <div>
-                    <label className="block text-sm font-medium text-gray-200 mb-1">Custom main category</label>
-                    <input
-                      value={menuForm.custom_category}
-                      onChange={(e) => setMenuForm((p) => ({ ...p, custom_category: e.target.value }))}
-                      className="w-full px-3 py-2 rounded-lg bg-black text-white border border-yellow-500/30"
-                      placeholder="Enter main category name"
-                    />
-                  </div>
-                )}
                 <div>
                   <label className="block text-sm font-medium text-gray-200 mb-1">
                     Subcategory (optional)
@@ -1907,6 +1885,7 @@ export default function AdminPage() {
               <div className="space-y-4">
                 {orders.map((order) => {
                   const customer = customersById[order.user_id];
+                  const instructionNotes = extractCustomerInstructionFromNotes(order.notes);
                   return (
                   <div
                     key={order.id}
@@ -1951,24 +1930,16 @@ export default function AdminPage() {
                             </p>
                           </div>
 
-                          {(() => {
-                            // Cart checkout currently appends "Customer: ...\nEmail: ..." to notes.
-                            // In admin UI, show only the actual customer instruction part.
-                            const raw = (order.notes || '').trim();
-                            if (!raw) return null;
-                            const instruction = raw.split('\n\nCustomer:')[0]?.trim();
-                            if (!instruction) return null;
-                            return (
-                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                                <p className="text-[11px] font-semibold text-gray-400">
-                                  Special instructions
-                                </p>
-                                <p className="mt-1 text-sm text-gray-200 whitespace-pre-wrap break-words">
-                                  {instruction}
-                                </p>
-                              </div>
-                            );
-                          })()}
+                          {instructionNotes ? (
+                            <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                              <p className="text-[11px] font-semibold text-gray-400">
+                                Special instructions
+                              </p>
+                              <p className="mt-1 text-sm text-gray-200 whitespace-pre-wrap break-words">
+                                {instructionNotes}
+                              </p>
+                            </div>
+                          ) : null}
                         </div>
                       </div>
 
@@ -2223,7 +2194,7 @@ export default function AdminPage() {
                 onClick={() => {
                   setEditingMenuItem(null);
                   setMenuForm({
-                    category: 'Pizza',
+                    category: '',
                     custom_category: '',
                     subcategory: '',
                     name: '',
@@ -2367,12 +2338,12 @@ export default function AdminPage() {
                         onClick={() => {
                           const resolvedCategory =
                             item.category === 'Others'
-                              ? item.custom_category || 'Others'
+                              ? item.custom_category?.trim() || 'Others'
                               : item.category;
                           setEditingMenuItem(item);
                           setMenuForm({
                             category: resolvedCategory,
-                            custom_category: resolvedCategory === 'Others' ? item.custom_category || '' : '',
+                            custom_category: '',
                             subcategory: item.subcategory || '',
                             name: item.name,
                             description: item.description,
