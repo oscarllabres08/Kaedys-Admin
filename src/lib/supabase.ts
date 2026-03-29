@@ -82,6 +82,8 @@ export type PaymentMethodSetting = {
   method: PaymentMethodCode;
   qr_storage_path: string | null;
   account_number: string | null;
+  /** Merchant name registered on the wallet (shown at checkout). */
+  account_name: string | null;
   updated_at: string;
 };
 
@@ -100,8 +102,26 @@ export type Announcement = {
   title: string;
   content: string;
   active: boolean;
+  /** `card` = homepage promo card + grid; `marquee` = hero overlay ticker only */
+  promo_type?: 'card' | 'marquee';
+  /** Storage path in `promo-card-images` bucket; optional hero for card promos */
+  card_image_path?: string | null;
   created_at: string;
 };
+
+const PROMO_CARD_IMAGE_BUCKET = 'promo-card-images';
+
+export function promoCardImagePublicUrl(
+  path: string | null | undefined,
+  cacheBust?: string | null
+): string | null {
+  if (!path) return null;
+  const { data } = supabase.storage.from(PROMO_CARD_IMAGE_BUCKET).getPublicUrl(path);
+  const v = cacheBust ? `?v=${encodeURIComponent(cacheBust)}` : '';
+  return `${data.publicUrl}${v}`;
+}
+
+export { PROMO_CARD_IMAGE_BUCKET };
 
 export type GalleryImage = {
   id: string;

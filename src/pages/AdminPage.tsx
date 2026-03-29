@@ -10,6 +10,8 @@ import {
   Order,
   OrderItem,
   PaymentMethodSetting,
+  PROMO_CARD_IMAGE_BUCKET,
+  promoCardImagePublicUrl,
 } from '../lib/supabase';
 import { extractCustomerInstructionFromNotes } from '../lib/orderNotes';
 import { useAuth } from '../contexts/AuthContext';
@@ -299,7 +301,13 @@ export default function AdminPage() {
 
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [annLoading, setAnnLoading] = useState(false);
-  const [newAnnouncement, setNewAnnouncement] = useState({ title: '', content: '' });
+  const [newAnnouncement, setNewAnnouncement] = useState({
+    title: '',
+    content: '',
+    promo_type: 'card' as 'card' | 'marquee',
+    cardImageFile: null as File | null,
+  });
+  const [removingCardImageId, setRemovingCardImageId] = useState<string | null>(null);
 
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
@@ -309,14 +317,16 @@ export default function AdminPage() {
   const [gameLoading, setGameLoading] = useState(false);
 
   const [paymentSettings, setPaymentSettings] = useState<Record<PaymentMethodSetting['method'], PaymentMethodSetting>>({
-    GCash: { method: 'GCash', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
-    Maya: { method: 'Maya', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
-    PayPal: { method: 'PayPal', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
+    GCash: { method: 'GCash', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
+    Maya: { method: 'Maya', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
+    PayPal: { method: 'PayPal', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
   });
-  const [paymentDrafts, setPaymentDrafts] = useState<Record<PaymentMethodSetting['method'], { file: File | null; accountNumber: string }>>({
-    GCash: { file: null, accountNumber: '' },
-    Maya: { file: null, accountNumber: '' },
-    PayPal: { file: null, accountNumber: '' },
+  const [paymentDrafts, setPaymentDrafts] = useState<
+    Record<PaymentMethodSetting['method'], { file: File | null; accountNumber: string; accountName: string }>
+  >({
+    GCash: { file: null, accountNumber: '', accountName: '' },
+    Maya: { file: null, accountNumber: '', accountName: '' },
+    PayPal: { file: null, accountNumber: '', accountName: '' },
   });
   const [paymentsLoading, setPaymentsLoading] = useState(false);
   const [savingPaymentMethod, setSavingPaymentMethod] = useState<PaymentMethodSetting['method'] | null>(null);
@@ -756,17 +766,82 @@ export default function AdminPage() {
   }, [activeTab, fetchArchivedOrders]);
 
   const createAnnouncement = async () => {
-    if (!newAnnouncement.title || !newAnnouncement.content) return;
+    const title = newAnnouncement.title.trim();
+    const content = newAnnouncement.content.trim();
+    if (newAnnouncement.promo_type === 'card') {
+      if (!title || !content) return;
+    } else if (!content) {
+      return;
+    }
+    const titleForDb = newAnnouncement.promo_type === 'marquee' ? title || 'Promo' : title;
+    let uploadedPath: string | null = null;
     try {
-      const { error } = await supabase
-        .from('announcements')
-        .insert([{ title: newAnnouncement.title, content: newAnnouncement.content, active: true }]);
+      if (newAnnouncement.promo_type === 'card' && newAnnouncement.cardImageFile) {
+        const file = newAnnouncement.cardImageFile;
+        if (!file.type.startsWith('image/')) {
+          openNoticeModal('Invalid file', 'Please choose an image file (PNG, JPG, WebP, or GIF).', 'error');
+          return;
+        }
+        const ext = file.name.split('.').pop() || 'jpg';
+        const objectPath = `cards/${Date.now()}-${Math.random().toString(36).slice(2, 11)}.${ext}`;
+        const { data: up, error: upErr } = await supabase.storage
+          .from(PROMO_CARD_IMAGE_BUCKET)
+          .upload(objectPath, file, { cacheControl: '3600', upsert: false });
+        if (upErr) throw upErr;
+        uploadedPath = up.path;
+      }
 
-      if (error) throw error;
-      setNewAnnouncement({ title: '', content: '' });
+      const { error } = await supabase.from('announcements').insert([
+        {
+          title: titleForDb,
+          content,
+          active: true,
+          promo_type: newAnnouncement.promo_type,
+          card_image_path: newAnnouncement.promo_type === 'card' ? uploadedPath : null,
+        },
+      ]);
+
+      if (error) {
+        if (uploadedPath) {
+          await supabase.storage.from(PROMO_CARD_IMAGE_BUCKET).remove([uploadedPath]);
+        }
+        throw error;
+      }
+      setNewAnnouncement({ title: '', content: '', promo_type: 'card', cardImageFile: null });
       await fetchAnnouncements();
     } catch (error) {
       console.error('Error creating announcement', error);
+      openNoticeModal('Could not post promo', 'Check your connection and try again.', 'error');
+    }
+  };
+
+  const removeAnnouncementCardImage = async (announcement: Announcement) => {
+    if (!announcement.card_image_path) return;
+    const ok = await askConfirm(
+      'Remove promo image',
+      'Delete this image from storage? Title and text stay on the promo.',
+      'Remove image',
+      'Cancel'
+    );
+    if (!ok) return;
+    setRemovingCardImageId(announcement.id);
+    try {
+      const { error: rmErr } = await supabase.storage
+        .from(PROMO_CARD_IMAGE_BUCKET)
+        .remove([announcement.card_image_path]);
+      if (rmErr) console.warn('Storage remove', rmErr);
+      const { error } = await supabase
+        .from('announcements')
+        .update({ card_image_path: null })
+        .eq('id', announcement.id);
+      if (error) throw error;
+      await fetchAnnouncements();
+      openNoticeModal('Image removed', 'Promo card image was deleted.', 'success');
+    } catch (error) {
+      console.error('Error removing promo image', error);
+      openNoticeModal('Remove failed', 'Could not remove the image.', 'error');
+    } finally {
+      setRemovingCardImageId(null);
     }
   };
 
@@ -795,6 +870,12 @@ export default function AdminPage() {
     if (!ok) return;
 
     try {
+      if (announcement.card_image_path) {
+        const { error: rmErr } = await supabase.storage
+          .from(PROMO_CARD_IMAGE_BUCKET)
+          .remove([announcement.card_image_path]);
+        if (rmErr) console.warn('Could not delete promo image from storage', rmErr);
+      }
       const { error } = await supabase.from('announcements').delete().eq('id', announcement.id);
       if (error) throw error;
       await fetchAnnouncements();
@@ -870,19 +951,19 @@ export default function AdminPage() {
     try {
       const { data, error } = await supabase
         .from('payment_method_settings')
-        .select('method, qr_storage_path, account_number, updated_at')
+        .select('method, qr_storage_path, account_number, account_name, updated_at')
         .in('method', WALLET_METHODS);
       if (error) throw error;
 
       const nextSettings: Record<PaymentMethodSetting['method'], PaymentMethodSetting> = {
-        GCash: { method: 'GCash', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
-        Maya: { method: 'Maya', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
-        PayPal: { method: 'PayPal', qr_storage_path: null, account_number: '', updated_at: new Date().toISOString() },
+        GCash: { method: 'GCash', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
+        Maya: { method: 'Maya', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
+        PayPal: { method: 'PayPal', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
       };
-      const nextDrafts: Record<PaymentMethodSetting['method'], { file: File | null; accountNumber: string }> = {
-        GCash: { file: null, accountNumber: '' },
-        Maya: { file: null, accountNumber: '' },
-        PayPal: { file: null, accountNumber: '' },
+      const nextDrafts: Record<PaymentMethodSetting['method'], { file: File | null; accountNumber: string; accountName: string }> = {
+        GCash: { file: null, accountNumber: '', accountName: '' },
+        Maya: { file: null, accountNumber: '', accountName: '' },
+        PayPal: { file: null, accountNumber: '', accountName: '' },
       };
 
       for (const row of (data || []) as PaymentMethodSetting[]) {
@@ -890,11 +971,13 @@ export default function AdminPage() {
           method: row.method,
           qr_storage_path: row.qr_storage_path ?? null,
           account_number: row.account_number ?? '',
+          account_name: row.account_name ?? '',
           updated_at: row.updated_at || new Date().toISOString(),
         };
         nextDrafts[row.method] = {
           file: null,
           accountNumber: row.account_number ?? '',
+          accountName: row.account_name ?? '',
         };
       }
       setPaymentSettings(nextSettings);
@@ -930,6 +1013,7 @@ export default function AdminPage() {
         .update({
           qr_storage_path: newPath,
           account_number: draft.accountNumber.trim() || null,
+          account_name: draft.accountName.trim() || null,
           updated_at: new Date().toISOString(),
         })
         .eq('method', method);
@@ -2383,16 +2467,80 @@ export default function AdminPage() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
               <div className="md:col-span-1 border border-dashed border-yellow-500/60 rounded-lg p-4 bg-black/40">
-                <h3 className="font-semibold text-yellow-300 mb-2">
-                  New Announcement
-                </h3>
+                <h3 className="font-semibold text-yellow-300 mb-2">New promo</h3>
+                <p className="text-[11px] text-gray-500 mb-3 leading-snug">
+                  Choose where this promo appears on the customer home page:
+                </p>
+                <ul className="text-[11px] text-gray-500 mb-3 list-disc pl-4 space-y-1 leading-snug">
+                  <li>
+                    <span className="text-gray-400">Promo update</span> — the promo card (megaphone) and the
+                    announcements list on large screens.
+                  </li>
+                  <li>
+                    <span className="text-gray-400">Promo sliding text</span> — a scrolling line across the{' '}
+                    <span className="text-gray-400">top of the store photo</span>.
+                  </li>
+                </ul>
+                <div className="mb-3 space-y-2">
+                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-sm text-gray-200 hover:border-yellow-500/40">
+                    <input
+                      type="radio"
+                      name="promo_type"
+                      className="mt-1 accent-yellow-400"
+                      checked={newAnnouncement.promo_type === 'card'}
+                      onChange={() =>
+                        setNewAnnouncement((prev) => ({ ...prev, promo_type: 'card' }))
+                      }
+                    />
+                    <span>Promo update (card and announcements)</span>
+                  </label>
+                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-sm text-gray-200 hover:border-yellow-500/40">
+                    <input
+                      type="radio"
+                      name="promo_type"
+                      className="mt-1 accent-yellow-400"
+                      checked={newAnnouncement.promo_type === 'marquee'}
+                      onChange={() =>
+                        setNewAnnouncement((prev) => ({ ...prev, promo_type: 'marquee', cardImageFile: null }))
+                      }
+                    />
+                    <span>Promo sliding text (top of store photo)</span>
+                  </label>
+                </div>
+                {newAnnouncement.promo_type === 'card' && (
+                  <div className="mb-2">
+                    <label className="block text-[11px] text-gray-400 mb-1">
+                      Optional card image (shown behind title &amp; details on the customer home page)
+                    </label>
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/jpg,image/webp,image/gif"
+                      onChange={(e) =>
+                        setNewAnnouncement((prev) => ({
+                          ...prev,
+                          cardImageFile: e.target.files?.[0] || null,
+                        }))
+                      }
+                      className="w-full text-xs text-gray-200"
+                    />
+                    {newAnnouncement.cardImageFile ? (
+                      <p className="text-[10px] text-gray-500 mt-1 truncate">
+                        Selected: {newAnnouncement.cardImageFile.name}
+                      </p>
+                    ) : null}
+                  </div>
+                )}
                 <input
                   type="text"
                   value={newAnnouncement.title}
                   onChange={(e) =>
                     setNewAnnouncement((prev) => ({ ...prev, title: e.target.value }))
                   }
-                  placeholder="Title"
+                  placeholder={
+                    newAnnouncement.promo_type === 'marquee'
+                      ? 'Short heading (optional)'
+                      : 'Promo title'
+                  }
                   className="w-full mb-2 px-3 py-2 border border-yellow-500/40 rounded-lg text-sm bg-black text-white"
                 />
                 <textarea
@@ -2400,15 +2548,20 @@ export default function AdminPage() {
                   onChange={(e) =>
                     setNewAnnouncement((prev) => ({ ...prev, content: e.target.value }))
                   }
-                  placeholder="Details"
+                  placeholder={
+                    newAnnouncement.promo_type === 'marquee'
+                      ? 'Text for the sliding line (required)'
+                      : 'Full promo details'
+                  }
                   rows={4}
                   className="w-full mb-3 px-3 py-2 border border-yellow-500/40 rounded-lg text-sm bg-black text-white"
                 />
                 <button
+                  type="button"
                   onClick={createAnnouncement}
                   className="w-full bg-yellow-400 text-black py-2 rounded-lg text-sm font-semibold hover:bg-yellow-300 transition-all"
                 >
-                  Post Announcement
+                  Post promo
                 </button>
               </div>
 
@@ -2429,40 +2582,85 @@ export default function AdminPage() {
                         className="border border-yellow-500/20 rounded-lg p-3 flex items-start justify-between gap-3 bg-black/40"
                       >
                         <div>
+                          <div className="flex flex-wrap items-center gap-2 mb-1">
+                            <span
+                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide border ${
+                                a.promo_type === 'marquee'
+                                  ? 'bg-amber-500/15 text-amber-200 border-amber-500/35'
+                                  : 'bg-yellow-500/15 text-yellow-200 border-yellow-500/35'
+                              }`}
+                            >
+                              {a.promo_type === 'marquee' ? 'Promo sliding text' : 'Promo update'}
+                            </span>
+                          </div>
+                          {a.promo_type !== 'marquee' && a.card_image_path ? (
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              <img
+                                src={promoCardImagePublicUrl(a.card_image_path, a.created_at) || ''}
+                                alt=""
+                                className="h-14 w-24 object-cover rounded border border-yellow-500/25"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => removeAnnouncementCardImage(a)}
+                                disabled={removingCardImageId === a.id}
+                                className="px-2 py-1 rounded-md text-[11px] font-semibold bg-neutral-800 text-amber-200 border border-yellow-500/30 hover:bg-neutral-700 disabled:opacity-50"
+                              >
+                                {removingCardImageId === a.id ? 'Removing…' : 'Delete image'}
+                              </button>
+                            </div>
+                          ) : null}
                           <p className="font-semibold text-yellow-300">{a.title}</p>
                           <p className="text-sm text-gray-200">{a.content}</p>
-                          <div
-                            className={`mt-1 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold ${
-                              a.active
-                                ? 'bg-green-500/20 text-green-300 border border-green-500/30'
-                                : 'bg-neutral-800 text-gray-300 border border-gray-700'
-                            }`}
-                          >
-                            {a.active ? 'Active now' : 'Inactive'}
-                          </div>
                           <p className="text-xs text-gray-500 mt-1">
                             {new Date(a.created_at).toLocaleString()}
                           </p>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => toggleAnnouncementActive(a)}
-                            className={`px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap ${
-                              a.active
-                                ? 'bg-green-500/20 text-green-300 border border-green-500/30'
-                                : 'bg-neutral-800 text-gray-300 border border-gray-700'
-                            }`}
-                          >
-                            {a.active ? 'Deactivate' : 'Activate'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => deleteAnnouncement(a)}
-                            className="px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
-                          >
-                            Delete
-                          </button>
+                        <div className="flex flex-col items-end gap-2 shrink-0">
+                          <div className="flex flex-wrap items-center justify-end gap-3">
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`text-[10px] font-extrabold uppercase tracking-wide ${
+                                  a.active ? 'text-gray-600' : 'text-yellow-300'
+                                }`}
+                              >
+                                Off
+                              </span>
+                              <button
+                                type="button"
+                                role="switch"
+                                aria-checked={a.active}
+                                aria-label={a.active ? 'Turn off — hide from customers' : 'Turn on — show to customers'}
+                                onClick={() => toggleAnnouncementActive(a)}
+                                className={`relative h-7 w-12 shrink-0 rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400/70 ${
+                                  a.active ? 'bg-green-600' : 'bg-neutral-600'
+                                }`}
+                              >
+                                <span
+                                  className={`pointer-events-none absolute top-1 left-1 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                                    a.active ? 'translate-x-5' : 'translate-x-0'
+                                  }`}
+                                />
+                              </button>
+                              <span
+                                className={`text-[10px] font-extrabold uppercase tracking-wide ${
+                                  a.active ? 'text-green-300' : 'text-gray-600'
+                                }`}
+                              >
+                                On
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => deleteAnnouncement(a)}
+                              className="px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-gray-500 text-right max-w-[14rem] leading-tight">
+                            {a.active ? 'Visible on site' : 'Hidden from site'}
+                          </p>
                         </div>
                       </div>
                     ))}
@@ -2531,12 +2729,13 @@ export default function AdminPage() {
               <h2 className="text-xl font-bold text-yellow-300">E-wallet Payments</h2>
             </div>
             <p className="text-sm text-gray-300 mb-2">
-              Set QR code and account number for <strong className="text-yellow-200">GCash, Maya, and PayPal</strong>.
-              Customers will see the selected wallet QR and account number in checkout.
+              Set QR code, <strong className="text-yellow-200">account name</strong>, and{' '}
+              <strong className="text-yellow-200">account number</strong> for GCash, Maya, and PayPal. Customers will
+              see these details at checkout.
             </p>
             <p className="text-xs text-gray-500 mb-6">
               Security: only <strong className="text-gray-400">active master admin</strong> can upload/delete wallet QR
-              and update account numbers.
+              and update account name and number.
             </p>
 
             {paymentsLoading ? (
@@ -2573,7 +2772,22 @@ export default function AdminPage() {
 
                       <div className="mt-3 space-y-3">
                         <div>
-                          <label className="block text-xs text-gray-400 mb-1">E-wallet account number</label>
+                          <label className="block text-xs text-gray-400 mb-1">Account name</label>
+                          <input
+                            type="text"
+                            value={draft.accountName}
+                            onChange={(e) =>
+                              setPaymentDrafts((prev) => ({
+                                ...prev,
+                                [method]: { ...prev[method], accountName: e.target.value },
+                              }))
+                            }
+                            className="w-full px-3 py-2 rounded-lg bg-black border border-yellow-500/35 text-white text-sm"
+                            placeholder="Name registered on this wallet"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-gray-400 mb-1">Account number</label>
                           <input
                             type="text"
                             value={draft.accountNumber}
@@ -2584,7 +2798,7 @@ export default function AdminPage() {
                               }))
                             }
                             className="w-full px-3 py-2 rounded-lg bg-black border border-yellow-500/35 text-white text-sm"
-                            placeholder={`Enter ${method} account number`}
+                            placeholder={`${method} mobile no. or account no.`}
                           />
                         </div>
                         <div>

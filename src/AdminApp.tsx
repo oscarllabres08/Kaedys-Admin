@@ -66,7 +66,7 @@ function AdminContent() {
 
   return (
     <>
-      <AdminOrderNotifications enabled={isApprovedAdmin} soundSrc="/sounds/neworder-meme.mp3" />
+      <AdminOrderNotifications enabled={isApprovedAdmin} soundSrc="/sounds/new-order.wav" />
       <AdminPage />
     </>
   );
