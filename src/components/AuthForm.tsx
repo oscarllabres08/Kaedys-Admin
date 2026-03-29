@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Eye, EyeOff } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { LegalModal } from './LegalModal';
 
 type AuthFormProps = {
   onSuccess: () => void;
@@ -303,45 +304,41 @@ export default function AuthForm({ onSuccess, requireAddress = true, adminSignUp
         </div>
       </div>
 
-      {showPrivacyAfterSignUp && (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 backdrop-blur-sm px-4">
-          <div className="w-full max-w-2xl rounded-2xl bg-neutral-950 border border-yellow-500/35 shadow-2xl overflow-hidden">
-            <div className="p-5 md:p-6">
-              <h3 className="text-xl font-bold text-yellow-300">Privacy Policy</h3>
-              <p className="text-xs text-gray-400 mt-1">By continuing, you acknowledge and accept this privacy notice.</p>
-
-              <div className="mt-4 max-h-[55vh] overflow-auto rounded-xl border border-yellow-500/20 bg-black/40 p-4 text-sm text-gray-200 space-y-3">
-                <p>
-                  We collect account and order information to provide food ordering and delivery services.
-                </p>
-                <ul className="list-disc pl-5 space-y-1">
-                  <li>Collected data may include full name, username, email, phone number, address, and order history.</li>
-                  <li>For GCash orders, we also process payment reference and uploaded proof of payment for verification.</li>
-                  <li>We use your data to process orders, contact you about deliveries, and provide customer support.</li>
-                  <li>Authorized staff only can access your order data for operations and verification.</li>
-                  <li>We do not sell your personal data to third parties.</li>
-                </ul>
-                <p>
-                  By using this service, you consent to the collection and processing of your data for these purposes.
-                </p>
-              </div>
-
-              <div className="mt-5 flex justify-end">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowPrivacyAfterSignUp(false);
-                    onSuccess();
-                  }}
-                  className="px-4 py-2 rounded-lg bg-yellow-400 text-black font-semibold hover:bg-yellow-300 transition-all"
-                >
-                  I Agree and Continue
-                </button>
-              </div>
-            </div>
-          </div>
+      <LegalModal
+        open={showPrivacyAfterSignUp}
+        onClose={() => {
+          setShowPrivacyAfterSignUp(false);
+          onSuccess();
+        }}
+        title="Privacy Policy"
+        description={
+          <p className="text-xs text-gray-400">By continuing, you acknowledge and accept this privacy notice.</p>
+        }
+      >
+        <div className="mt-4 max-h-[55vh] space-y-3 overflow-auto rounded-xl border border-yellow-500/20 bg-black/40 p-4 text-sm text-gray-200">
+          <p>We collect account and order information to provide food ordering and delivery services.</p>
+          <ul className="list-disc space-y-1 pl-5">
+            <li>Collected data may include full name, username, email, phone number, address, and order history.</li>
+            <li>For GCash orders, we also process payment reference and uploaded proof of payment for verification.</li>
+            <li>We use your data to process orders, contact you about deliveries, and provide customer support.</li>
+            <li>Authorized staff only can access your order data for operations and verification.</li>
+            <li>We do not sell your personal data to third parties.</li>
+          </ul>
+          <p>By using this service, you consent to the collection and processing of your data for these purposes.</p>
         </div>
-      )}
+        <div className="mt-5 flex justify-end">
+          <button
+            type="button"
+            onClick={() => {
+              setShowPrivacyAfterSignUp(false);
+              onSuccess();
+            }}
+            className="rounded-lg bg-yellow-400 px-4 py-2 font-semibold text-black transition-all duration-200 hover:bg-yellow-300 active:scale-[0.98]"
+          >
+            I Agree and Continue
+          </button>
+        </div>
+      </LegalModal>
     </div>
   );
 }

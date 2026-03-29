@@ -1515,24 +1515,26 @@ export default function AdminPage() {
   ) : null;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-black to-neutral-900 pb-8">
+    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-gradient-to-br from-black to-neutral-900 pb-8">
       {noticeModalEl}
       {confirmModalEl}
       {/* Top bar */}
       <header className="sticky top-0 z-20 bg-black/80 backdrop-blur border-b border-yellow-500/20">
-        <div className="w-full px-4 md:px-6 py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="h-11 w-11 md:h-12 md:w-12 rounded-full border-2 border-yellow-400 overflow-hidden bg-black">
+        <div className="w-full min-w-0 px-4 md:px-6 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="h-11 w-11 md:h-12 md:w-12 shrink-0 rounded-full border-2 border-yellow-400 overflow-hidden bg-black">
               <img
                 src="/assets/kaedypizza.jpg"
                 alt="KaeDy's Pizza Hub Logo"
                 className="h-full w-full object-cover"
               />
             </div>
-            <div className="leading-tight">
-              <p className="text-base md:text-lg font-bold text-yellow-300">KaeDy&apos;s Pizza Hub</p>
-              <div className="flex flex-wrap items-center gap-2">
-                <p className="text-[11px] md:text-xs text-gray-400">
+            <div className="leading-tight min-w-0">
+              <p className="text-base md:text-lg font-bold text-yellow-300 truncate sm:whitespace-normal">
+                KaeDy&apos;s Pizza Hub
+              </p>
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                <p className="text-[11px] md:text-xs text-gray-400 truncate max-w-[min(42vw,12rem)] sm:max-w-none">
                   {adminProfile?.full_name ? `Admin: ${adminProfile.full_name}` : 'Admin Dashboard'}
                 </p>
                 {adminProfile?.full_name && (
@@ -1756,8 +1758,8 @@ export default function AdminPage() {
         )}
       </header>
 
-      <div className="w-full px-4 md:px-6 pt-6">
-        <div className="flex gap-6">
+      <div className="w-full min-w-0 max-w-[100vw] overflow-x-hidden px-4 md:px-6 pt-6 box-border">
+        <div className="flex gap-6 min-w-0">
           {/* Desktop sidebar */}
           <aside className="hidden md:flex w-64 shrink-0">
             <div className="w-full sticky top-[88px] h-[calc(100vh-104px)] rounded-2xl border border-yellow-500/25 bg-black/30 p-3 flex flex-col">
