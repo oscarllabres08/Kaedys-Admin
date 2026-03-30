@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, Loader2, TrendingUp } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronDown, Download, Loader2, Check, TrendingUp } from 'lucide-react';
 import { supabase } from '../../lib/supabase';
 import { buildSalesReportExcelHtml, downloadArchivedOrdersExcel, type OrderWithItems } from '../../lib/exportArchivedOrdersCsv';
 
@@ -50,6 +50,107 @@ function startEndForToday(d: Date): { start: Date; end: Date } {
   return { start, end };
 }
 
+function startEndForDay(day: number, month: number, year: number): { start: Date; end: Date } {
+  const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+  const end = new Date(year, month - 1, day, 23, 59, 59, 999);
+  return { start, end };
+}
+
+function daysInMonth(month: number, year: number) {
+  // month is 1..12
+  return new Date(year, month, 0).getDate();
+}
+
+function toDateInputValue(d: Date) {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function DropdownNumber({
+  label,
+  value,
+  options,
+  formatOption,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  options: number[];
+  formatOption: (v: number) => string;
+  onChange: (next: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const el = rootRef.current;
+      if (!el) return;
+      if (e.target instanceof Node && !el.contains(e.target)) setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  const selectedLabel = formatOption(value);
+
+  return (
+    <div className="relative" ref={rootRef}>
+      <label className="text-xs font-semibold text-gray-400">{label}</label>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="mt-2 w-full sm:w-auto px-3 py-2 rounded-lg border border-yellow-500/25 bg-black/40 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-400/60 inline-flex items-center justify-between gap-2"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="min-w-[3rem] text-left">{selectedLabel}</span>
+        <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </button>
+      {open && (
+        <div className="absolute z-[60] mt-2 w-full sm:w-[12rem] max-h-60 overflow-auto rounded-xl border border-yellow-500/25 bg-neutral-950/95 shadow-2xl">
+          <div className="p-2 border-b border-yellow-500/10">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">Select</p>
+          </div>
+          <div role="listbox" aria-label={label} className="p-1">
+            {options.map((opt) => {
+              const active = opt === value;
+              return (
+                <button
+                  key={opt}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onClick={() => {
+                    onChange(opt);
+                    setOpen(false);
+                  }}
+                  className={`w-full text-left px-3 py-2 rounded-lg text-sm transition-all flex items-center justify-between gap-3 ${
+                    active
+                      ? 'bg-yellow-400/15 text-yellow-200 border border-yellow-500/30'
+                      : 'text-gray-100 hover:bg-white/5'
+                  }`}
+                >
+                  <span>{formatOption(opt)}</span>
+                  {active ? <Check className="w-4 h-4 text-yellow-300" /> : <span className="w-4 h-4" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function SalesReportsPanel() {
   const now = new Date();
   const [loading, setLoading] = useState(false);
@@ -59,15 +160,28 @@ export default function SalesReportsPanel() {
 
   const [month, setMonth] = useState<number>(now.getMonth() + 1);
   const [year, setYear] = useState<number>(now.getFullYear());
+  const [monthDay, setMonthDay] = useState<number>(now.getDate());
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>('all');
 
-  const [dateMode, setDateMode] = useState<'month' | 'today'>('today');
+  const [dateMode, setDateMode] = useState<'month' | 'today' | 'exact' | 'monthDay'>('today');
   const [todayDate, setTodayDate] = useState<Date>(() => new Date());
+  const [exactDate, setExactDate] = useState<Date>(() => new Date());
 
   const range = useMemo(() => {
     if (dateMode === 'today') return startEndForToday(todayDate);
-    return startEndForMonthYear(month, year);
-  }, [dateMode, month, year, todayDate]);
+    // "Month" button behaves like calendar day picking (month/day within the chosen year),
+    // then filters exactly that day.
+    if (dateMode === 'month') return startEndForDay(monthDay, month, year);
+    if (dateMode === 'monthDay') return startEndForDay(monthDay, month, year);
+    return startEndForToday(exactDate);
+  }, [dateMode, month, year, todayDate, monthDay, exactDate]);
+
+  // Clamp day selection to the actual number of days in the chosen month/year.
+  useEffect(() => {
+    if (dateMode !== 'monthDay') return;
+    const max = daysInMonth(month, year);
+    setMonthDay((d) => Math.max(1, Math.min(d, max)));
+  }, [dateMode, month, year]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -141,9 +255,14 @@ export default function SalesReportsPanel() {
 
       const html = buildSalesReportExcelHtml(selected);
       const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+
+      const rangeStart = new Date(range.start);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const rangeSlug = `${rangeStart.getFullYear()}-${pad(rangeStart.getMonth() + 1)}-${pad(rangeStart.getDate())}`;
+
       downloadArchivedOrdersExcel(
         html,
-        `kaedys-sales-report-${year}-${String(month).padStart(2, '0')}-${channelFilter}-${stamp}.xls`
+        `kaedys-sales-report-${rangeSlug}-${channelFilter}-${stamp}.xls`
       );
     } catch (e) {
       console.error(e);
@@ -151,7 +270,7 @@ export default function SalesReportsPanel() {
     } finally {
       setExporting(false);
     }
-  }, [channelFilter, filteredRows.length, month, range.end, range.start, year]);
+  }, [channelFilter, dateMode, filteredRows.length, month, monthDay, range.end, range.start, year]);
 
   const yearOptions = useMemo(() => {
     const base = now.getFullYear();
@@ -169,60 +288,67 @@ export default function SalesReportsPanel() {
         </div>
 
         <div className="flex flex-col sm:flex-row sm:items-end sm:justify-end gap-3">
-          <div className="flex items-center gap-2">
-            <label className="text-xs font-semibold text-gray-400">Month</label>
-            <select
-              value={month}
-            onChange={(e) => {
-              setDateMode('month');
-              setMonth(Number(e.target.value));
-            }}
-              className="px-3 py-2 rounded-lg border border-yellow-500/25 bg-black/40 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-400/60"
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                const d = new Date();
+                setTodayDate(d);
+                setExactDate(d);
+                setMonth(d.getMonth() + 1);
+                setMonthDay(d.getDate());
+                setYear(d.getFullYear());
+                setDateMode('today');
+              }}
+              className={`px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                dateMode === 'today'
+                  ? 'bg-yellow-400 text-black border-yellow-400'
+                  : 'border-yellow-500/25 text-gray-300 hover:bg-white/5'
+              }`}
             >
-              {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-                <option key={m} value={m}>
-                  {monthName(m - 1)}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="text-xs font-semibold text-gray-400">Year</label>
-            <select
-              value={year}
-            onChange={(e) => {
-              setDateMode('month');
-              setYear(Number(e.target.value));
-            }}
-              className="px-3 py-2 rounded-lg border border-yellow-500/25 bg-black/40 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-400/60"
+              Today
+            </button>
+            <button
+              type="button"
+              onClick={() => setDateMode('month')}
+              className={`px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
+                dateMode === 'month'
+                  ? 'bg-yellow-400 text-black border-yellow-400'
+                  : 'border-yellow-500/25 text-gray-300 hover:bg-white/5'
+              }`}
             >
-              {yearOptions.map((y) => (
-                <option key={y} value={y}>
-                  {y}
-                </option>
-              ))}
-            </select>
+              Month
+            </button>
           </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              const d = new Date();
-              setTodayDate(d);
-              setDateMode('today');
-              setMonth(d.getMonth() + 1);
-              setYear(d.getFullYear());
-            }}
-            className={`px-3 py-2 rounded-lg text-xs font-semibold border transition-all ${
-              dateMode === 'today'
-                ? 'bg-yellow-400 text-black border-yellow-400'
-                : 'border-yellow-500/25 text-gray-300 hover:bg-white/5'
-            }`}
-          >
-            Today
-          </button>
-        </div>
-          <div className="flex items-center gap-2">
+
+          <div className="flex flex-wrap items-center gap-2 justify-end">
+            {dateMode === 'month' && (
+              <div className="flex flex-col sm:flex-row sm:items-end gap-2">
+                <label className="text-xs font-semibold text-gray-400">Pick date</label>
+                <input
+                  type="date"
+                  min={`${year}-01-01`}
+                  max={`${year}-12-31`}
+                  value={`${year}-${String(month).padStart(2, '0')}-${String(monthDay).padStart(2, '0')}`}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (!v) return;
+                    const parsed = new Date(`${v}T00:00:00`);
+                    const nextMonth = parsed.getMonth() + 1;
+                    const nextDay = parsed.getDate();
+                    setMonth(nextMonth);
+                    setMonthDay(nextDay);
+                    // Keep range within the chosen year.
+                    const nextExact = new Date(year, nextMonth - 1, nextDay, 0, 0, 0, 0);
+                    setExactDate(nextExact);
+                    setTodayDate(nextExact);
+                    setDateMode('month');
+                  }}
+                  className="px-3 py-2 rounded-lg border border-yellow-500/25 bg-black/40 text-gray-100 text-sm focus:outline-none focus:ring-2 focus:ring-yellow-400/60"
+                />
+              </div>
+            )}
+
             <button
               type="button"
               disabled={filteredRows.length === 0 || exporting}
@@ -237,7 +363,7 @@ export default function SalesReportsPanel() {
       </div>
 
       <p className="text-sm text-gray-400 mb-4">
-        {dateMode === 'today' ? 'Today' : `${monthName(month - 1)} ${year}`} · completed orders only
+        {dateMode === 'today' ? 'Today' : dateMode === 'month' ? `${monthName(month - 1)} ${monthDay}, ${year}` : exactDate.toLocaleDateString()} · completed orders only
       </p>
 
       <div className="mb-5 grid grid-cols-1 sm:grid-cols-3 gap-4">
