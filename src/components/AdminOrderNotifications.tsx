@@ -73,34 +73,39 @@ export default function AdminOrderNotifications({
     };
   }, [audio]);
 
-  const unlockAudio = useCallback(async () => {
+  const unlockAudio = useCallback(() => {
+    if (soundUnlockedRef.current) return;
+
     const html = audioRef.current;
     if (html) {
       try {
         html.volume = 0.001;
-        await html.play();
-        html.pause();
-        html.currentTime = 0;
-        html.volume = 1;
+        const pending = html.play();
+        if (pending !== undefined) {
+          void pending
+            .then(() => {
+              html.pause();
+              html.currentTime = 0;
+              html.volume = 1;
+            })
+            .catch(() => {
+              html.volume = 1;
+            });
+        }
       } catch {
-        // still try Web Audio below
+        html.volume = 1;
       }
     }
 
     const Ctx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (Ctx && !audioContextRef.current) {
+    if (Ctx) {
       try {
-        const ctx = new Ctx();
-        await ctx.resume();
-        audioContextRef.current = ctx;
-      } catch {
-        // ignore
-      }
-    } else if (audioContextRef.current?.state === 'suspended') {
-      try {
-        await audioContextRef.current.resume();
+        if (!audioContextRef.current) {
+          audioContextRef.current = new Ctx();
+        }
+        void audioContextRef.current.resume();
       } catch {
         // ignore
       }
@@ -108,20 +113,43 @@ export default function AdminOrderNotifications({
 
     soundUnlockedRef.current = true;
     setSoundUnlocked(true);
+
+    try {
+      localStorage.setItem('kaedys_admin_order_sound_unlocked', '1');
+    } catch {
+      // ignore
+    }
   }, []);
 
   useEffect(() => {
     if (!enabled) return;
     const onFirstInteraction = () => {
-      void unlockAudio();
+      unlockAudio();
     };
-    window.addEventListener('pointerdown', onFirstInteraction, { passive: true });
-    window.addEventListener('keydown', onFirstInteraction);
+    const pointerOpts: AddEventListenerOptions = { capture: true, passive: true };
+    const keyOpts: AddEventListenerOptions = { capture: true };
+    document.addEventListener('pointerdown', onFirstInteraction, pointerOpts);
+    document.addEventListener('touchstart', onFirstInteraction, pointerOpts);
+    document.addEventListener('click', onFirstInteraction, pointerOpts);
+    document.addEventListener('keydown', onFirstInteraction, keyOpts);
     return () => {
-      window.removeEventListener('pointerdown', onFirstInteraction);
-      window.removeEventListener('keydown', onFirstInteraction);
+      document.removeEventListener('pointerdown', onFirstInteraction, pointerOpts);
+      document.removeEventListener('touchstart', onFirstInteraction, pointerOpts);
+      document.removeEventListener('click', onFirstInteraction, pointerOpts);
+      document.removeEventListener('keydown', onFirstInteraction, keyOpts);
     };
   }, [enabled, unlockAudio]);
+
+  useEffect(() => {
+    if (!enabled || !soundUnlocked) return;
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return;
+      const ctx = audioContextRef.current;
+      if (ctx?.state === 'suspended') void ctx.resume();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [enabled, soundUnlocked]);
 
   const playAlertSound = useCallback(async () => {
     if (!soundUnlockedRef.current) return;
@@ -241,7 +269,7 @@ export default function AdminOrderNotifications({
       {!soundUnlocked ? (
         <button
           type="button"
-          onClick={() => void unlockAudio()}
+          onClick={() => unlockAudio()}
           className="group relative w-full overflow-hidden rounded-2xl border-2 border-yellow-400/55 bg-gradient-to-br from-yellow-500/[0.12] via-neutral-950/95 to-neutral-950/95 px-3 py-3 text-left shadow-[0_0_28px_rgba(250,204,21,0.12)] backdrop-blur transition-all hover:border-yellow-400/90 hover:shadow-[0_0_36px_rgba(250,204,21,0.22)] active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400/80 sm:px-4 sm:py-3.5"
         >
           <span
@@ -258,19 +286,19 @@ export default function AdminOrderNotifications({
             <div className="min-w-0 flex-1 pt-0.5">
               <p className="flex flex-wrap items-center gap-1.5 text-xs font-extrabold uppercase tracking-wide text-yellow-300">
                 <Sparkles className="h-3.5 w-3.5 shrink-0 text-yellow-400" aria-hidden />
-                Tap to hear new orders
+                Enable order sounds
               </p>
               <p className="mt-1 text-[11px] leading-snug text-gray-200">
-                The browser mutes alerts until you interact.{' '}
-                <span className="font-semibold text-white">Tap this card</span> or press a key — once — to
-                unlock sounds.
+                Browsers block audio until you interact with the page.{' '}
+                <span className="font-semibold text-white">Click or tap anywhere</span> on this admin
+                screen once (menu, orders, a button) — or press a key — to unlock alerts.
               </p>
               <div className="mt-2.5 flex flex-wrap items-center gap-2">
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-yellow-400 px-2.5 py-1 text-[10px] font-extrabold uppercase tracking-wide text-black shadow-md">
                   <MousePointerClick className="h-3 w-3" aria-hidden />
-                  Tap here
+                  Or tap here
                 </span>
-                <span className="text-[10px] font-medium text-yellow-200/90">← Required step</span>
+                <span className="text-[10px] font-medium text-yellow-200/90">One-time after refresh</span>
               </div>
             </div>
           </div>
@@ -290,8 +318,9 @@ export default function AdminOrderNotifications({
               Order sounds are on
             </p>
             <p className="mt-1 text-[11px] leading-snug text-gray-200">
-              New orders will play an alert in this tab. If you stop hearing it, refresh the page and tap
-              once again — browsers can suspend audio after idle.
+              New orders will play an alert in this tab. If audio stops after the tab was idle, click
+              anywhere on this page once or return to this tab — browsers may suspend audio until you
+              interact again.
             </p>
           </div>
         </div>

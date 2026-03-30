@@ -9,11 +9,22 @@ import {
   MenuItem,
   Order,
   OrderItem,
+  AdminActivityLog,
+  PaymentMethodCode,
   PaymentMethodSetting,
   PROMO_CARD_IMAGE_BUCKET,
   promoCardImagePublicUrl,
 } from '../lib/supabase';
+import { logAdminActivity, type LogAdminActivityInput } from '../lib/adminActivityLog';
 import { extractCustomerInstructionFromNotes } from '../lib/orderNotes';
+import {
+  buildArchivedOrdersReportExcelHtml,
+  downloadArchivedOrdersExcel,
+} from '../lib/exportArchivedOrdersCsv';
+import { compressImageBeforeUpload } from '../lib/compressImage';
+import { deletePaymentProofAndClearUrl } from '../lib/paymentProofStorage';
+import { formatActivityActionLabel } from '../lib/formatActivityAction';
+import { formatSupabaseError } from '../lib/formatSupabaseError';
 import { useAuth } from '../contexts/AuthContext';
 import {
   Pizza,
@@ -29,18 +40,30 @@ import {
   Trash2,
   ClipboardList,
   Loader2,
+  Download,
   Menu as MenuIcon,
   Search,
   SlidersHorizontal,
   X,
   LogOut,
+  History,
 } from 'lucide-react';
 
 type OrderWithItems = Order & {
   order_items: OrderItem[];
 };
 
-type TabId = 'orders' | 'archived' | 'menu' | 'announcements' | 'gallery' | 'gcash' | 'game' | 'users' | 'admins';
+type TabId =
+  | 'orders'
+  | 'archived'
+  | 'menu'
+  | 'announcements'
+  | 'gallery'
+  | 'gcash'
+  | 'game'
+  | 'users'
+  | 'admins'
+  | 'activity';
 
 const STATUS_LABELS: { id: Order['status']; label: string }[] = [
   { id: 'pending', label: 'Pending' },
@@ -72,7 +95,8 @@ function isTabId(value: string): value is TabId {
     value === 'gcash' ||
     value === 'game' ||
     value === 'users' ||
-    value === 'admins'
+    value === 'admins' ||
+    value === 'activity'
   );
 }
 
@@ -199,64 +223,17 @@ async function sendStatusEmail(order: Order, newStatus: Order['status']) {
   }
 }
 
-type ImageCompressOptions = {
-  maxWidth: number;
-  maxHeight: number;
-  maxBytes: number;
-  quality?: number;
-};
+const GALLERY_MAX_IMAGES = 15;
 
-async function compressImageBeforeUpload(file: File, opts: ImageCompressOptions): Promise<File> {
-  if (!file.type.startsWith('image/')) return file;
-  if (file.size <= opts.maxBytes) return file;
-
-  const qualityStart = opts.quality ?? 0.82;
-  const qualities = [qualityStart, 0.72, 0.62, 0.52, 0.42];
-  const objectUrl = URL.createObjectURL(file);
-
+function galleryObjectPathFromPublicUrl(imageUrl: string): string | null {
   try {
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const el = new Image();
-      el.onload = () => resolve(el);
-      el.onerror = reject;
-      el.src = objectUrl;
-    });
-
-    const ratio = Math.min(opts.maxWidth / img.width, opts.maxHeight / img.height, 1);
-    const targetW = Math.max(1, Math.round(img.width * ratio));
-    const targetH = Math.max(1, Math.round(img.height * ratio));
-
-    const canvas = document.createElement('canvas');
-    canvas.width = targetW;
-    canvas.height = targetH;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return file;
-    ctx.drawImage(img, 0, 0, targetW, targetH);
-
-    let bestBlob: Blob | null = null;
-    for (const q of qualities) {
-      const blob = await new Promise<Blob | null>((resolve) => {
-        canvas.toBlob((b) => resolve(b), 'image/webp', q);
-      });
-      if (!blob) continue;
-      if (!bestBlob || blob.size < bestBlob.size) bestBlob = blob;
-      if (blob.size <= opts.maxBytes) {
-        bestBlob = blob;
-        break;
-      }
-    }
-
-    if (!bestBlob || bestBlob.size >= file.size) return file;
-
-    const safeBaseName = file.name.replace(/\.[^.]+$/, '');
-    return new File([bestBlob], `${safeBaseName}.webp`, {
-      type: 'image/webp',
-      lastModified: Date.now(),
-    });
+    const u = new URL(imageUrl);
+    const marker = '/object/public/gallery/';
+    const i = u.pathname.indexOf(marker);
+    if (i === -1) return null;
+    return decodeURIComponent(u.pathname.slice(i + marker.length));
   } catch {
-    return file;
-  } finally {
-    URL.revokeObjectURL(objectUrl);
+    return null;
   }
 }
 
@@ -270,7 +247,25 @@ export default function AdminPage() {
     return 'orders';
   });
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [paymentProofLightboxUrl, setPaymentProofLightboxUrl] = useState<string | null>(null);
+  const [activityLogs, setActivityLogs] = useState<AdminActivityLog[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
   const isMasterAdmin = !!adminProfile?.is_master_admin;
+
+  const logActivity = useCallback(
+    (input: LogAdminActivityInput) => {
+      if (!adminProfile?.id || !adminProfile.is_active) return;
+      void logAdminActivity(
+        {
+          id: adminProfile.id,
+          email: adminProfile.email,
+          fullName: adminProfile.full_name,
+        },
+        input
+      );
+    },
+    [adminProfile]
+  );
 
   const [orders, setOrders] = useState<OrderWithItems[]>([]);
   const [ordersLoading, setOrdersLoading] = useState(false);
@@ -278,6 +273,7 @@ export default function AdminPage() {
   const [archivedOrders, setArchivedOrders] = useState<OrderWithItems[]>([]);
   const [archivedOrdersLoading, setArchivedOrdersLoading] = useState(false);
   const [selectedArchivedOrderIds, setSelectedArchivedOrderIds] = useState<Set<string>>(new Set());
+  const [expandedArchivedOrderIds, setExpandedArchivedOrderIds] = useState<Set<string>>(new Set());
   const [deletingSelectedArchivedOrders, setDeletingSelectedArchivedOrders] = useState(false);
 
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
@@ -312,6 +308,8 @@ export default function AdminPage() {
   const [galleryImages, setGalleryImages] = useState<GalleryImage[]>([]);
   const [galleryLoading, setGalleryLoading] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  const [gallerySelectedIds, setGallerySelectedIds] = useState<Set<string>>(new Set());
+  const [deletingGallery, setDeletingGallery] = useState(false);
 
   const [gameSettings, setGameSettings] = useState<GameSettings | null>(null);
   const [gameLoading, setGameLoading] = useState(false);
@@ -540,6 +538,23 @@ export default function AdminPage() {
     }
   }, []);
 
+  const fetchActivityLogs = useCallback(async () => {
+    setActivityLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('admin_activity_log')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(400);
+      if (error) throw error;
+      setActivityLogs((data || []) as AdminActivityLog[]);
+    } catch (error) {
+      console.error('Error loading admin activity log', error);
+    } finally {
+      setActivityLoading(false);
+    }
+  }, []);
+
   const fetchMenuItems = async () => {
     setMenuLoading(true);
     try {
@@ -565,19 +580,28 @@ export default function AdminPage() {
         .eq('id', order.id);
 
       if (error) throw error;
+      if (status === 'completed' && order.payment_proof_url) {
+        await deletePaymentProofAndClearUrl(order.id, order.payment_proof_url);
+      }
       await sendStatusEmail(order, status);
       await fetchOrders();
       // DB trigger archives completed orders / updates archive flags — keep both lists in sync.
       await fetchArchivedOrders();
+      logActivity({
+        action: 'order.status_changed',
+        resourceType: 'order',
+        resourceId: order.id,
+        summary: `Order #${order.id.slice(0, 8)} status ${order.status} → ${status}`,
+        metadata: { from: order.status, to: status },
+      });
     } catch (error) {
       console.error('Error updating order status', error);
     }
   };
 
   const markAllOrdersCompleted = async () => {
-    const targetIds = orders
-      .filter((o) => o.status !== 'completed' && o.status !== 'cancelled')
-      .map((o) => o.id);
+    const toComplete = orders.filter((o) => o.status !== 'completed' && o.status !== 'cancelled');
+    const targetIds = toComplete.map((o) => o.id);
 
     if (targetIds.length === 0) {
       openNoticeModal('No active orders', 'There are no active orders to mark as completed.', 'info');
@@ -600,12 +624,21 @@ export default function AdminPage() {
         .in('id', targetIds);
       if (error) throw error;
 
+      await Promise.all(
+        toComplete.filter((o) => o.payment_proof_url).map((o) => deletePaymentProofAndClearUrl(o.id, o.payment_proof_url!))
+      );
+
       await fetchOrders();
       await fetchArchivedOrders();
       openNoticeModal('Orders completed', `${targetIds.length} order(s) moved to archive.`, 'success');
+      logActivity({
+        action: 'order.mark_all_completed',
+        summary: `Marked ${targetIds.length} order(s) as completed`,
+        metadata: { count: targetIds.length },
+      });
     } catch (error) {
       console.error('Error marking all orders completed', error);
-      openNoticeModal('Update failed', 'Could not mark all orders as completed.', 'error');
+      showDbError('Update failed', error, 'Could not mark all orders as completed.');
     } finally {
       setMarkingAllCompleted(false);
     }
@@ -628,9 +661,15 @@ export default function AdminPage() {
       if (error) throw error;
       await fetchArchivedOrders();
       openNoticeModal('Archived order deleted', `Order #${order.id.slice(0, 8)} was deleted.`, 'success');
+      logActivity({
+        action: 'order.archived_deleted',
+        resourceType: 'order',
+        resourceId: order.id,
+        summary: `Deleted archived order #${order.id.slice(0, 8)}`,
+      });
     } catch (error) {
       console.error('Error deleting archived order', error);
-      openNoticeModal('Delete failed', 'Could not delete archived order. Please try again.', 'error');
+      showDbError('Delete failed', error, 'Could not delete archived order. Please try again.');
     }
   };
 
@@ -649,6 +688,15 @@ export default function AdminPage() {
 
   const clearArchivedSelection = () => {
     setSelectedArchivedOrderIds(new Set());
+  };
+
+  const toggleArchivedDetails = (orderId: string) => {
+    setExpandedArchivedOrderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(orderId)) next.delete(orderId);
+      else next.add(orderId);
+      return next;
+    });
   };
 
   const deleteSelectedArchivedOrders = async () => {
@@ -672,13 +720,37 @@ export default function AdminPage() {
       await fetchArchivedOrders();
       setSelectedArchivedOrderIds(new Set());
       openNoticeModal('Archived orders deleted', `${ids.length} archived order(s) were deleted.`, 'success');
+      logActivity({
+        action: 'order.archived_bulk_deleted',
+        summary: `Deleted ${ids.length} archived order(s)`,
+        metadata: { count: ids.length },
+      });
     } catch (error) {
       console.error('Error deleting selected archived orders', error);
-      openNoticeModal('Delete failed', 'Could not delete selected archived orders.', 'error');
+      showDbError('Delete failed', error, 'Could not delete selected archived orders.');
     } finally {
       setDeletingSelectedArchivedOrders(false);
     }
   };
+
+  const exportArchivedCsv = useCallback(() => {
+    const ids = selectedArchivedOrderIds;
+    const list =
+      ids.size > 0 ? archivedOrders.filter((o) => ids.has(o.id)) : archivedOrders;
+    if (list.length === 0) {
+      openNoticeModal('Nothing to export', 'No archived orders to export.', 'info');
+      return;
+    }
+    const html = buildArchivedOrdersReportExcelHtml(list);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const suffix = ids.size > 0 ? `selected-${ids.size}` : 'all';
+    downloadArchivedOrdersExcel(html, `kaedys-archived-orders-${suffix}-${stamp}.xls`);
+    logActivity({
+      action: 'archive.export_excel',
+      summary: `Exported archived orders (${list.length} row(s), ${ids.size > 0 ? 'selected' : 'all'})`,
+      metadata: { count: list.length, mode: ids.size > 0 ? 'selected' : 'all' },
+    });
+  }, [archivedOrders, selectedArchivedOrderIds, logActivity]);
 
   const toggleMenuAvailability = async (item: MenuItem) => {
     try {
@@ -688,6 +760,13 @@ export default function AdminPage() {
         .eq('id', item.id);
       if (error) throw error;
       await fetchMenuItems();
+      logActivity({
+        action: 'menu.availability_toggled',
+        resourceType: 'menu_item',
+        resourceId: item.id,
+        summary: `${item.name}: available ${item.is_available ? 'off' : 'on'}`,
+        metadata: { wasAvailable: item.is_available },
+      });
     } catch (error) {
       console.error('Error updating menu availability', error);
     }
@@ -765,6 +844,11 @@ export default function AdminPage() {
     fetchArchivedOrders();
   }, [activeTab, fetchArchivedOrders]);
 
+  useEffect(() => {
+    if (activeTab !== 'activity') return;
+    void fetchActivityLogs();
+  }, [activeTab, fetchActivityLogs]);
+
   const createAnnouncement = async () => {
     const title = newAnnouncement.title.trim();
     const content = newAnnouncement.content.trim();
@@ -777,11 +861,18 @@ export default function AdminPage() {
     let uploadedPath: string | null = null;
     try {
       if (newAnnouncement.promo_type === 'card' && newAnnouncement.cardImageFile) {
-        const file = newAnnouncement.cardImageFile;
-        if (!file.type.startsWith('image/')) {
+        const raw = newAnnouncement.cardImageFile;
+        if (!raw.type.startsWith('image/')) {
           openNoticeModal('Invalid file', 'Please choose an image file (PNG, JPG, WebP, or GIF).', 'error');
           return;
         }
+        const file = await compressImageBeforeUpload(raw, {
+          maxWidth: 1200,
+          maxHeight: 1200,
+          maxBytes: 380 * 1024,
+          quality: 0.78,
+          force: true,
+        });
         const ext = file.name.split('.').pop() || 'jpg';
         const objectPath = `cards/${Date.now()}-${Math.random().toString(36).slice(2, 11)}.${ext}`;
         const { data: up, error: upErr } = await supabase.storage
@@ -809,9 +900,15 @@ export default function AdminPage() {
       }
       setNewAnnouncement({ title: '', content: '', promo_type: 'card', cardImageFile: null });
       await fetchAnnouncements();
+      logActivity({
+        action: 'promo.created',
+        resourceType: 'announcement',
+        summary: `Created promo (${newAnnouncement.promo_type}): ${titleForDb.slice(0, 80)}`,
+        metadata: { promo_type: newAnnouncement.promo_type },
+      });
     } catch (error) {
       console.error('Error creating announcement', error);
-      openNoticeModal('Could not post promo', 'Check your connection and try again.', 'error');
+      showDbError('Could not post promo', error, 'Check your connection and try again.');
     }
   };
 
@@ -837,9 +934,15 @@ export default function AdminPage() {
       if (error) throw error;
       await fetchAnnouncements();
       openNoticeModal('Image removed', 'Promo card image was deleted.', 'success');
+      logActivity({
+        action: 'promo.card_image_removed',
+        resourceType: 'announcement',
+        resourceId: announcement.id,
+        summary: `Removed promo card image: ${announcement.title}`,
+      });
     } catch (error) {
       console.error('Error removing promo image', error);
-      openNoticeModal('Remove failed', 'Could not remove the image.', 'error');
+      showDbError('Remove failed', error, 'Could not remove the image.');
     } finally {
       setRemovingCardImageId(null);
     }
@@ -854,9 +957,15 @@ export default function AdminPage() {
 
       if (error) throw error;
       await fetchAnnouncements();
+      logActivity({
+        action: 'promo.visibility_toggled',
+        resourceType: 'announcement',
+        resourceId: announcement.id,
+        summary: `Promo "${announcement.title}" active: ${!announcement.active}`,
+      });
     } catch (error) {
       console.error('Error updating announcement', error);
-      openNoticeModal('Update failed', 'Failed to update promo visibility.', 'error');
+      showDbError('Update failed', error, 'Failed to update promo visibility.');
     }
   };
 
@@ -878,11 +987,17 @@ export default function AdminPage() {
       }
       const { error } = await supabase.from('announcements').delete().eq('id', announcement.id);
       if (error) throw error;
+      logActivity({
+        action: 'promo.deleted',
+        resourceType: 'announcement',
+        resourceId: announcement.id,
+        summary: `Deleted promo: ${announcement.title}`,
+      });
       await fetchAnnouncements();
       openNoticeModal('Promo deleted', `"${announcement.title}" was removed.`, 'success');
     } catch (error) {
       console.error('Error deleting announcement', error);
-      openNoticeModal('Delete failed', 'Failed to delete promo.', 'error');
+      showDbError('Delete failed', error, 'Failed to delete promo.');
     }
   };
 
@@ -905,26 +1020,43 @@ export default function AdminPage() {
 
   const handleGalleryUpload = async (file: File | null) => {
     if (!file) return;
-    if (galleryImages.length >= 10) {
-      openNoticeModal('Limit reached', 'Maximum of 10 gallery images reached.', 'info');
+    if (galleryImages.length >= GALLERY_MAX_IMAGES) {
+      openNoticeModal(
+        'Limit reached',
+        `Maximum of ${GALLERY_MAX_IMAGES} gallery images reached.`,
+        'info'
+      );
       return;
     }
 
     setUploadingImage(true);
     try {
       const uploadFile = await compressImageBeforeUpload(file, {
-        maxWidth: 1400,
-        maxHeight: 1400,
-        maxBytes: 700 * 1024,
-        quality: 0.82,
+        maxWidth: 1200,
+        maxHeight: 1200,
+        maxBytes: 380 * 1024,
+        quality: 0.78,
+        force: true,
       });
-      const fileExt = uploadFile.name.split('.').pop();
+      const fileExt = uploadFile.name.split('.').pop() || 'webp';
       const fileName = `gallery-${Date.now()}.${fileExt}`;
       const { data: uploadData, error: uploadError } = await supabase.storage
         .from('gallery')
-        .upload(fileName, uploadFile);
+        .upload(fileName, uploadFile, { cacheControl: '31536000', upsert: false });
 
-      if (uploadError) throw uploadError;
+      if (uploadError) {
+        const msg = uploadError.message || String(uploadError);
+        if (/bucket not found/i.test(msg)) {
+          openNoticeModal(
+            'Storage not ready',
+            'Gallery storage bucket is missing. Run the latest Supabase migration (gallery bucket) or create a public bucket named "gallery" in the dashboard.',
+            'error'
+          );
+        } else {
+          openNoticeModal('Upload failed', msg, 'error');
+        }
+        return;
+      }
 
       const { data: urlData } = supabase.storage.from('gallery').getPublicUrl(uploadData.path);
 
@@ -939,8 +1071,14 @@ export default function AdminPage() {
 
       if (insertError) throw insertError;
       await fetchGallery();
+      logActivity({
+        action: 'gallery.image_uploaded',
+        resourceType: 'gallery_image',
+        summary: 'Uploaded new gallery image',
+      });
     } catch (error) {
       console.error('Error uploading gallery image', error);
+      showDbError('Upload failed', error, 'Could not upload image.');
     } finally {
       setUploadingImage(false);
     }
@@ -999,11 +1137,18 @@ export default function AdminPage() {
         if (!draft.file.type.startsWith('image/')) {
           throw new Error('Please choose an image file (PNG, JPG, etc.).');
         }
-        const ext = draft.file.name.split('.').pop() || 'png';
+        const uploadFile = await compressImageBeforeUpload(draft.file, {
+          maxWidth: 1200,
+          maxHeight: 1200,
+          maxBytes: 380 * 1024,
+          quality: 0.78,
+          force: true,
+        });
+        const ext = uploadFile.name.split('.').pop() || 'png';
         const objectPath = `${method.toLowerCase()}-${Date.now()}.${ext}`;
         const { data: uploadData, error: uploadError } = await supabase.storage
           .from('payment-qr')
-          .upload(objectPath, draft.file, { cacheControl: '3600', upsert: false });
+          .upload(objectPath, uploadFile, { cacheControl: '3600', upsert: false });
         if (uploadError) throw uploadError;
         newPath = uploadData.path;
       }
@@ -1032,9 +1177,16 @@ export default function AdminPage() {
 
       await fetchPaymentSettings();
       openNoticeModal('Payment details updated', `${method} payment details were updated successfully.`, 'success');
+      logActivity({
+        action: 'payment_settings.updated',
+        resourceType: 'payment_method_setting',
+        resourceId: method,
+        summary: `Updated ${method} payment / QR settings`,
+        metadata: { qrChanged: !!draft.file },
+      });
     } catch (error) {
       console.error(`Error saving ${method} payment settings`, error);
-      openNoticeModal('Update failed', `Failed to save ${method} settings. Please try again.`, 'error');
+      showDbError('Update failed', error, `Failed to save ${method} settings. Please try again.`);
     } finally {
       setSavingPaymentMethod(null);
     }
@@ -1099,6 +1251,10 @@ export default function AdminPage() {
     setNoticeModal({ open: true, title, message, variant });
   };
 
+  const showDbError = (title: string, error: unknown, fallback: string) => {
+    openNoticeModal(title, formatSupabaseError(error, fallback), 'error');
+  };
+
   const askConfirm = (
     title: string,
     message: string,
@@ -1123,6 +1279,59 @@ export default function AdminPage() {
     });
   };
 
+  useEffect(() => {
+    const valid = new Set(galleryImages.map((g) => g.id));
+    setGallerySelectedIds((prev) => new Set([...prev].filter((id) => valid.has(id))));
+  }, [galleryImages]);
+
+  useEffect(() => {
+    if (!paymentProofLightboxUrl) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setPaymentProofLightboxUrl(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [paymentProofLightboxUrl]);
+
+  const removeGalleryFromStorage = async (rows: GalleryImage[]) => {
+    const paths = rows
+      .map((r) => galleryObjectPathFromPublicUrl(r.image_url))
+      .filter((p): p is string => !!p);
+    if (paths.length === 0) return;
+    const { error } = await supabase.storage.from('gallery').remove(paths);
+    if (error) console.warn('Gallery storage delete:', error);
+  };
+
+  const executeGalleryDelete = async (ids: string[]) => {
+    if (ids.length === 0) return;
+    const rows = galleryImages.filter((g) => ids.includes(g.id));
+    setDeletingGallery(true);
+    try {
+      await removeGalleryFromStorage(rows);
+      const { error } = await supabase.from('gallery_images').delete().in('id', ids);
+      if (error) throw error;
+      await fetchGallery();
+      setGallerySelectedIds(new Set());
+      openNoticeModal('Gallery updated', `${ids.length} image(s) removed.`, 'success');
+      logActivity({
+        action: 'gallery.images_deleted',
+        summary: `Deleted ${ids.length} gallery image(s)`,
+        metadata: { count: ids.length },
+      });
+    } catch (e) {
+      console.error(e);
+      showDbError('Delete failed', e, 'Could not delete gallery image(s).');
+    } finally {
+      setDeletingGallery(false);
+    }
+  };
+
+  const confirmDeleteGalleryIds = async (ids: string[], title: string, message: string) => {
+    const ok = await askConfirm(title, message, 'Delete', 'Cancel');
+    if (!ok) return;
+    await executeGalleryDelete(ids);
+  };
+
   const suspendUser = async (customer: CustomerProfile, hours: number) => {
     try {
       const until = new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
@@ -1136,9 +1345,16 @@ export default function AdminPage() {
       if (error) throw error;
       await fetchManagedUsers();
       openNoticeModal('User suspended', `User suspended until ${new Date(until).toLocaleString()}.`, 'success');
+      logActivity({
+        action: 'user.suspended',
+        resourceType: 'customer_profile',
+        resourceId: customer.id,
+        summary: `Suspended ${customer.full_name || customer.email || customer.id} for ${hours}h`,
+        metadata: { until },
+      });
     } catch (error) {
       console.error('Error suspending user', error);
-      openNoticeModal('Suspend failed', 'Failed to suspend user.', 'error');
+      showDbError('Suspend failed', error, 'Failed to suspend user.');
     }
   };
 
@@ -1153,9 +1369,15 @@ export default function AdminPage() {
         .eq('id', customer.id);
       if (error) throw error;
       await fetchManagedUsers();
+      logActivity({
+        action: 'user.unsuspended',
+        resourceType: 'customer_profile',
+        resourceId: customer.id,
+        summary: `Unsuspended ${customer.full_name || customer.email || customer.id}`,
+      });
     } catch (error) {
       console.error('Error unsuspending user', error);
-      openNoticeModal('Unsuspend failed', 'Failed to remove suspension.', 'error');
+      showDbError('Unsuspend failed', error, 'Failed to remove suspension.');
     }
   };
 
@@ -1177,9 +1399,15 @@ export default function AdminPage() {
       if (error) throw error;
       await fetchManagedUsers();
       openNoticeModal('User deleted', 'User account deleted.', 'success');
+      logActivity({
+        action: 'user.account_deleted',
+        resourceType: 'customer_profile',
+        resourceId: customer.id,
+        summary: `Deleted customer account: ${label}`,
+      });
     } catch (error) {
       console.error('Error deleting user account', error);
-      openNoticeModal('Delete failed', 'Failed to delete user account.', 'error');
+      showDbError('Delete failed', error, 'Failed to delete user account.');
     }
   };
 
@@ -1195,9 +1423,16 @@ export default function AdminPage() {
         .eq('id', admin.id);
       if (error) throw error;
       await fetchAdmins();
+      logActivity({
+        action: 'admin.approval_updated',
+        resourceType: 'admin_profile',
+        resourceId: admin.id,
+        summary: `${makeActive ? 'Approved' : 'Disabled'} admin: ${admin.full_name} (${admin.email})`,
+        metadata: { makeActive },
+      });
     } catch (error) {
       console.error('Error updating admin approval status', error);
-      openNoticeModal('Update failed', 'Failed to update admin status. Please try again.', 'error');
+      showDbError('Update failed', error, 'Failed to update admin status. Please try again.');
     }
   };
 
@@ -1215,8 +1450,15 @@ export default function AdminPage() {
 
       if (error) throw error;
       await fetchGameSettings();
+      logActivity({
+        action: 'game.falling_pizza_toggled',
+        resourceType: 'game_settings',
+        resourceId: gameSettings.id,
+        summary: `Discount game (falling pizza) ${!(gameSettings.falling_pizza_active ?? gameSettings.is_active) ? 'ON' : 'OFF'}`,
+      });
     } catch (error) {
       console.error('Error updating game settings', error);
+      showDbError('Update failed', error, 'Could not update game settings.');
     }
   };
 
@@ -1261,6 +1503,17 @@ export default function AdminPage() {
       >
         <Archive className="w-4 h-4" />
         Archived Orders
+      </button>
+      <button
+        onClick={() => handleSelectTab('activity')}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+          activeTab === 'activity'
+            ? 'bg-yellow-400 text-black shadow-lg'
+            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
+        }`}
+      >
+        <History className="w-4 h-4" />
+        Activity log
       </button>
       <button
         onClick={() => handleSelectTab('menu')}
@@ -1403,9 +1656,20 @@ export default function AdminPage() {
       if (editingMenuItem) {
         const { error } = await supabase.from('menu_items').update(payload).eq('id', editingMenuItem.id);
         if (error) throw error;
+        logActivity({
+          action: 'menu.item_updated',
+          resourceType: 'menu_item',
+          resourceId: editingMenuItem.id,
+          summary: `Updated menu item: ${payload.name}`,
+        });
       } else {
         const { error } = await supabase.from('menu_items').insert([{ ...payload, is_available: true }]);
         if (error) throw error;
+        logActivity({
+          action: 'menu.item_created',
+          resourceType: 'menu_item',
+          summary: `Created menu item: ${payload.name}`,
+        });
       }
 
       setMenuModalOpen(false);
@@ -1413,7 +1677,7 @@ export default function AdminPage() {
       await fetchMenuItems();
     } catch (error) {
       console.error('Error saving menu item', error);
-      openNoticeModal('Save failed', 'Failed to save menu item. Please try again.', 'error');
+      showDbError('Save failed', error, 'Failed to save menu item. Please try again.');
     }
   };
 
@@ -1423,11 +1687,17 @@ export default function AdminPage() {
     try {
       const { error } = await supabase.from('menu_items').delete().eq('id', deleteMenuItem.id);
       if (error) throw error;
+      logActivity({
+        action: 'menu.item_deleted',
+        resourceType: 'menu_item',
+        resourceId: deleteMenuItem.id,
+        summary: `Deleted menu item: ${deleteMenuItem.name}`,
+      });
       setDeleteMenuItem(null);
       await fetchMenuItems();
     } catch (error) {
       console.error('Error deleting menu item', error);
-      openNoticeModal('Delete failed', 'Failed to delete product. Please try again.', 'error');
+      showDbError('Delete failed', error, 'Failed to delete product. Please try again.');
     } finally {
       setDeletingMenuItem(false);
     }
@@ -1518,6 +1788,35 @@ export default function AdminPage() {
     <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-gradient-to-br from-black to-neutral-900 pb-8">
       {noticeModalEl}
       {confirmModalEl}
+      {paymentProofLightboxUrl ? (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center px-3 py-16 sm:px-5 sm:py-20 bg-black/85 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Payment proof preview"
+          onClick={() => setPaymentProofLightboxUrl(null)}
+        >
+          <button
+            type="button"
+            className="absolute top-3 right-3 z-[101] inline-flex items-center justify-center rounded-xl border border-yellow-500/40 bg-black/70 p-2.5 text-yellow-200 hover:bg-yellow-500/15 hover:text-white transition-colors"
+            onClick={() => setPaymentProofLightboxUrl(null)}
+            aria-label="Isara ang larawan"
+          >
+            <X className="w-5 h-5" />
+          </button>
+          <div
+            className="relative flex h-[calc(100vh-5.5rem)] max-h-[92vh] w-[min(96vw,1600px)] items-center justify-center"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <img
+              src={paymentProofLightboxUrl}
+              alt="Payment proof"
+              className="h-full w-full object-contain rounded-xl border border-yellow-500/25 bg-black/40 shadow-2xl select-none"
+              draggable={false}
+            />
+          </div>
+        </div>
+      ) : null}
       {/* Top bar */}
       <header className="sticky top-0 z-20 bg-black/80 backdrop-blur border-b border-yellow-500/20">
         <div className="w-full min-w-0 px-4 md:px-6 py-3 flex items-center justify-between gap-3">
@@ -1637,6 +1936,20 @@ export default function AdminPage() {
                   <span className="flex items-center gap-2">
                     <Archive className="w-4 h-4" />
                     Archived Orders
+                  </span>
+                </button>
+
+                <button
+                  onClick={() => handleSelectTab('activity')}
+                  className={`w-full inline-flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold ${
+                    activeTab === 'activity'
+                      ? 'bg-yellow-400 text-black'
+                      : 'bg-neutral-800 text-gray-100'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <History className="w-4 h-4" />
+                    Activity log
                   </span>
                 </button>
 
@@ -1981,47 +2294,47 @@ export default function AdminPage() {
                       {/* Left: customer info */}
                       <div className="rounded-2xl border border-yellow-500/20 bg-black/30 p-4">
                         <div className="flex items-center gap-3 mb-3">
-                          <p className="text-base font-bold text-yellow-200">Customer Information</p>
-                          <span className="ml-auto px-2 py-0.5 rounded-full text-[10px] font-semibold border border-yellow-500/40 bg-black/40 text-gray-200">
+                          <p className="text-lg font-bold text-yellow-200">Customer Information</p>
+                          <span className="ml-auto px-2.5 py-1 rounded-full text-xs font-semibold border border-yellow-500/40 bg-black/40 text-gray-200">
                             {order.order_items.length} item{order.order_items.length !== 1 ? 's' : ''}
                           </span>
                         </div>
 
                         <div className="space-y-3">
                           <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-[11px] font-semibold text-gray-400">Name</p>
-                            <p className="mt-1 text-gray-100 font-semibold leading-snug break-words">
+                            <p className="text-sm font-semibold text-gray-400">Name</p>
+                            <p className="mt-1.5 text-base text-gray-100 font-semibold leading-snug break-words">
                               {customer?.full_name || 'Unknown customer'}
                             </p>
                           </div>
 
                           <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-[11px] font-semibold text-gray-400">Email</p>
-                            <p className="mt-1 text-gray-200 leading-snug break-words">
+                            <p className="text-sm font-semibold text-gray-400">Email</p>
+                            <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
                               {customer?.email || 'No email'}
                             </p>
                           </div>
 
                           <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-[11px] font-semibold text-gray-400">Contact no.</p>
-                            <p className="mt-1 text-gray-100 leading-snug break-words">
+                            <p className="text-sm font-semibold text-gray-400">Contact no.</p>
+                            <p className="mt-1.5 text-base text-gray-100 leading-snug break-words">
                               {order.contact_phone || customer?.phone || 'No phone'}
                             </p>
                           </div>
 
                           <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-[11px] font-semibold text-gray-400">Address</p>
-                            <p className="mt-1 text-gray-200 leading-snug break-words">
+                            <p className="text-sm font-semibold text-gray-400">Address</p>
+                            <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
                               {order.delivery_address || customer?.address || 'No address provided'}
                             </p>
                           </div>
 
                           {instructionNotes ? (
                             <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                              <p className="text-[11px] font-semibold text-gray-400">
+                              <p className="text-sm font-semibold text-gray-400">
                                 Special instructions
                               </p>
-                              <p className="mt-1 text-sm text-gray-200 whitespace-pre-wrap break-words">
+                              <p className="mt-1.5 text-base text-gray-200 whitespace-pre-wrap break-words">
                                 {instructionNotes}
                               </p>
                             </div>
@@ -2033,10 +2346,10 @@ export default function AdminPage() {
                       <div className="rounded-2xl border border-yellow-500/20 bg-black/30 p-4 flex flex-col">
                         <div className="flex items-start gap-3">
                           <div className="min-w-0">
-                            <p className="text-base font-bold text-yellow-200">
+                            <p className="text-lg md:text-xl font-bold text-yellow-200">
                               Order #{order.id.slice(0, 8)}
                             </p>
-                            <p className="text-sm text-gray-400">
+                            <p className="text-base text-gray-300 mt-0.5">
                               {new Date(order.created_at).toLocaleString(undefined, {
                                 year: 'numeric',
                                 month: 'short',
@@ -2049,15 +2362,15 @@ export default function AdminPage() {
                         </div>
 
                         <div className="mt-3 flex flex-wrap items-center gap-2">
-                          <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold border border-white/10 bg-black/30 text-gray-200">
+                          <span className="px-2.5 py-1 rounded-full text-sm font-semibold border border-white/10 bg-black/30 text-gray-200">
                             {order.payment_method}
                           </span>
                           <div className="ml-auto flex items-center gap-2">
-                            <span className="text-xs text-gray-400">Status</span>
+                            <span className="text-sm font-medium text-gray-300">Status</span>
                             <select
                               value={order.status}
                               onChange={(e) => updateOrderStatus(order, e.target.value as Order['status'])}
-                              className="text-sm font-semibold border border-yellow-500/35 rounded-xl px-3 py-2 bg-black/50 text-white focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                              className="text-base font-semibold border border-yellow-500/35 rounded-xl px-3 py-2.5 bg-black/50 text-white focus:outline-none focus:ring-2 focus:ring-yellow-400 min-h-[44px]"
                             >
                               {STATUS_LABELS.map((s) => (
                                 <option key={s.id} value={s.id}>
@@ -2068,43 +2381,44 @@ export default function AdminPage() {
                           </div>
                         </div>
 
-                        {order.payment_method === 'GCash' && (
+                        {WALLET_METHODS.includes(order.payment_method as PaymentMethodCode) && (
                           <div className="mt-3 rounded-xl border border-yellow-500/15 bg-black/25 p-3">
                             <div className="flex items-start justify-between gap-3">
                               <div className="min-w-0">
-                                <p className="text-xs font-semibold text-gray-300 mb-1">GCash Payment Details</p>
-                                <p className="text-[11px] font-semibold text-gray-400">Reference Number</p>
-                                <p className="mt-1 text-sm font-semibold text-yellow-200 break-words">
+                                <p className="text-sm font-semibold text-gray-200 mb-1">
+                                  {order.payment_method} Payment Details
+                                </p>
+                                <p className="text-sm font-semibold text-gray-400">Reference Number</p>
+                                <p className="mt-1.5 text-base font-semibold text-yellow-200 break-words">
                                   {order.payment_reference || '—'}
                                 </p>
                               </div>
 
                               {order.payment_proof_url ? (
-                                <a
-                                  href={order.payment_proof_url}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="shrink-0"
-                                  aria-label="View payment proof"
-                                  title="Click to view full payment proof"
+                                <button
+                                  type="button"
+                                  onClick={() => setPaymentProofLightboxUrl(order.payment_proof_url)}
+                                  className="shrink-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400 focus:ring-offset-2 focus:ring-offset-black/80"
+                                  aria-label="Palakihin ang payment proof"
+                                  title="I-click para makita nang malaki"
                                 >
                                   <img
                                     src={order.payment_proof_url}
                                     alt="Payment proof"
-                                    className="w-24 h-24 object-contain rounded-lg border border-white/10 bg-black/60 hover:opacity-90 transition-opacity"
+                                    className="w-24 h-24 object-contain rounded-lg border border-white/10 bg-black/60 hover:opacity-90 hover:border-yellow-500/40 transition-all cursor-zoom-in"
                                   />
-                                </a>
+                                </button>
                               ) : (
-                                <p className="text-[11px] text-gray-500 mt-1">No proof uploaded</p>
+                                <p className="text-sm text-gray-500 mt-1">No proof uploaded</p>
                               )}
                             </div>
                           </div>
                         )}
 
-                        <div className="mt-4 rounded-xl border border-yellow-500/15 bg-black/30 p-3">
-                          <div className="flex items-center justify-between gap-3 mb-2">
-                            <p className="text-xs font-semibold text-gray-300">Items</p>
-                            <p className="text-xs text-gray-500">
+                        <div className="mt-4 rounded-xl border border-yellow-500/15 bg-black/30 p-3 md:p-4">
+                          <div className="flex items-center justify-between gap-3 mb-3">
+                            <p className="text-sm font-semibold text-gray-200">Items</p>
+                            <p className="text-sm text-gray-400">
                               {order.order_items.length} item{order.order_items.length !== 1 ? 's' : ''}
                             </p>
                           </div>
@@ -2114,7 +2428,7 @@ export default function AdminPage() {
                               return (
                                 <div
                                   key={item.id}
-                                  className="flex items-center justify-between gap-3 rounded-lg bg-black/40 px-2 py-2"
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-black/40 px-3 py-2.5"
                                 >
                                   <div className="flex items-center gap-3 min-w-0">
                                     {menuItem && (
@@ -2125,16 +2439,16 @@ export default function AdminPage() {
                                       />
                                     )}
                                     <div className="min-w-0">
-                                      <p className="text-sm text-gray-100 leading-snug break-words">
+                                      <p className="text-base text-gray-100 leading-snug break-words">
                                         <span className="text-gray-300 font-semibold">{item.quantity}×</span>{' '}
                                         {item.menu_item_name}
                                       </p>
-                                      <p className="text-[11px] text-gray-400">
+                                      <p className="text-sm text-gray-400 mt-0.5">
                                         ₱{item.price.toFixed(2)} each
                                       </p>
                                     </div>
                                   </div>
-                                  <p className="text-sm font-semibold text-yellow-200 whitespace-nowrap">
+                                  <p className="text-base font-semibold text-yellow-200 whitespace-nowrap">
                                     ₱{item.subtotal.toFixed(2)}
                                   </p>
                                 </div>
@@ -2145,19 +2459,36 @@ export default function AdminPage() {
 
                         {/* Bottom summary */}
                         <div className="mt-4 pt-4 border-t border-yellow-500/15 flex items-end justify-between gap-3">
-                          <div className="text-xs text-gray-400">
-                            <p>Summary</p>
+                          <div className="text-sm text-gray-300 min-w-0 space-y-1.5">
+                            <p className="font-semibold text-gray-200 text-base">Summary</p>
+                            <p className="text-sm text-gray-400">
+                              Order total (subtotal):{' '}
+                              <span className="text-yellow-200 tabular-nums font-medium">₱{order.total_amount.toFixed(2)}</span>
+                            </p>
                             {order.discount_amount > 0 ? (
-                              <p className="text-[11px] text-green-300/90 mt-1">
-                                Discount: -₱{order.discount_amount.toFixed(2)}
-                              </p>
+                              <div className="space-y-1">
+                                {order.discount_amount - (order.wallet_discount_amount ?? 0) > 0.001 && (
+                                  <p className="text-sm text-green-300">
+                                    Promo discount: -₱
+                                    {(order.discount_amount - (order.wallet_discount_amount ?? 0)).toFixed(2)}
+                                  </p>
+                                )}
+                                {(order.wallet_discount_amount ?? 0) > 0.001 && (
+                                  <p className="text-sm text-emerald-300">
+                                    Wallet discount: -₱{(order.wallet_discount_amount ?? 0).toFixed(2)}
+                                  </p>
+                                )}
+                                <p className="text-sm text-gray-400">
+                                  Total discount: -₱{order.discount_amount.toFixed(2)}
+                                </p>
+                              </div>
                             ) : (
-                              <p className="text-[11px] text-gray-500 mt-1">No discount</p>
+                              <p className="text-sm text-gray-500">No discount</p>
                             )}
                           </div>
-                          <div className="text-right">
-                            <p className="text-xs text-gray-400">Total</p>
-                            <p className="text-xl font-extrabold text-yellow-300 leading-tight">
+                          <div className="text-right shrink-0">
+                            <p className="text-sm text-gray-400">Discounted total</p>
+                            <p className="text-2xl md:text-3xl font-extrabold text-yellow-300 leading-tight tabular-nums">
                               ₱{order.final_amount.toFixed(2)}
                             </p>
                           </div>
@@ -2173,12 +2504,32 @@ export default function AdminPage() {
 
         {activeTab === 'archived' && (
           <section className="bg-neutral-900 rounded-xl shadow-lg p-4 md:p-6 border border-yellow-500/30">
-            <div className="flex items-center gap-2 mb-4">
-              <Archive className="w-5 h-5 text-yellow-400" />
-              <h2 className="text-xl font-bold text-yellow-300">Archived Orders</h2>
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between mb-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Archive className="w-5 h-5 text-yellow-400" />
+                  <h2 className="text-xl font-bold text-yellow-300">Archived Orders</h2>
+                </div>
+                <p className="text-sm text-gray-300 mt-1">
+                  List view: use the arrow to show full order details (items, payment, totals). No contact or address on
+                  this page. Auto-archived orders may be removed after 3 days.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={exportArchivedCsv}
+                disabled={archivedOrders.length === 0}
+                className="inline-flex items-center justify-center gap-2 shrink-0 px-4 py-2.5 rounded-xl text-sm font-semibold bg-yellow-400 text-black hover:bg-yellow-300 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Download className="w-4 h-4" />
+                Export Excel
+              </button>
             </div>
-            <p className="text-sm text-gray-300 mb-4">
-              Completed orders are auto-archived and automatically deleted after 3 days.
+            <p className="text-xs text-gray-500 mb-4">
+              Export uses <span className="text-gray-300">all listed orders</span> unless you select rows — then only{' '}
+              <span className="text-gray-300">selected</span> orders are included. Downloads an Excel file (.xls):{' '}
+              <span className="text-gray-300">one row per order</span> — products and quantities are listed together in one
+              column; <span className="text-gray-300">order total is the last column</span> (centered). No personal data.
             </p>
 
             {archivedOrdersLoading ? (
@@ -2188,7 +2539,7 @@ export default function AdminPage() {
             ) : archivedOrders.length === 0 ? (
               <p className="text-gray-300 text-center py-6">No archived orders yet.</p>
             ) : (
-              <div className="space-y-2">
+              <div className="space-y-4">
                 <div className="flex flex-col gap-3 rounded-xl border border-yellow-500/15 bg-black/30 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div className="text-sm text-gray-200">
                     <span className="font-semibold text-yellow-300">{selectedArchivedOrderIds.size}</span> selected
@@ -2210,6 +2561,14 @@ export default function AdminPage() {
                     </button>
                     <button
                       type="button"
+                      onClick={exportArchivedCsv}
+                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-xs font-semibold border border-yellow-400/50 text-yellow-200 hover:bg-yellow-500/10 transition-colors"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Export
+                    </button>
+                    <button
+                      type="button"
                       onClick={deleteSelectedArchivedOrders}
                       disabled={selectedArchivedOrderIds.size === 0 || deletingSelectedArchivedOrders}
                       className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-xs font-semibold bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-60"
@@ -2219,51 +2578,207 @@ export default function AdminPage() {
                     </button>
                   </div>
                 </div>
-                {archivedOrders.map((order) => {
-                  const customer = customersById[order.user_id];
-                  return (
-                    <div
-                      key={order.id}
-                      className="border border-yellow-500/20 rounded-lg px-3 py-2 bg-black/35"
-                    >
-                      <div className="grid grid-cols-1 lg:grid-cols-[1.6fr_1.1fr_0.9fr_0.8fr] items-center gap-3">
-                        <div className="min-w-0 flex items-center gap-2">
+                <div className="rounded-xl border border-yellow-500/20 bg-black/25 overflow-hidden divide-y divide-yellow-500/15">
+                  {archivedOrders.map((order) => {
+                    const customer = customersById[order.user_id];
+                    const statusLabel = order.status.replace(/_/g, ' ');
+                    const expanded = expandedArchivedOrderIds.has(order.id);
+                    const placedShort = new Date(order.created_at).toLocaleString(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                    });
+                    return (
+                      <div key={order.id} className="bg-black/20">
+                        <div className="flex flex-wrap items-center gap-2 sm:gap-3 py-2.5 px-3 sm:px-4">
                           <input
                             type="checkbox"
                             checked={selectedArchivedOrderIds.has(order.id)}
                             onChange={() => toggleSelectArchivedOrder(order.id)}
+                            onClick={(e) => e.stopPropagation()}
                             className="h-4 w-4 accent-yellow-400 shrink-0"
                             aria-label={`Select archived order ${order.id.slice(0, 8)}`}
                           />
-                          <p className="text-sm font-bold text-yellow-200 whitespace-nowrap">#{order.id.slice(0, 8)}</p>
-                          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-500/20 text-green-300 border border-green-500/40 whitespace-nowrap">
-                            Completed
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-300 truncate">
-                          {customer?.full_name || 'Unknown'} {customer?.email ? `(${customer.email})` : ''}
-                        </p>
-                        <p className="text-xs text-gray-500 truncate">
-                          Archived: {order.archived_at ? new Date(order.archived_at).toLocaleString() : '—'}
-                        </p>
-                        <div className="flex items-center gap-3 lg:justify-end">
-                          <p className="text-xs text-gray-300">
-                            <span className="text-gray-500">Payment:</span> {order.payment_method}
-                          </p>
-                          <p className="text-base font-bold text-yellow-300 whitespace-nowrap">₱{order.final_amount.toFixed(2)}</p>
                           <button
                             type="button"
-                            onClick={() => deleteArchivedOrder(order)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-red-700 text-white hover:bg-red-600 transition-all"
+                            onClick={() => toggleArchivedDetails(order.id)}
+                            className="inline-flex items-center justify-center rounded-lg border border-yellow-500/30 bg-black/40 p-1.5 text-yellow-200 hover:bg-yellow-500/10 transition-colors shrink-0"
+                            aria-expanded={expanded}
+                            aria-label={expanded ? 'Hide order details' : 'Show order details'}
+                            title="Details"
+                          >
+                            <ChevronDown
+                              className={`w-4 h-4 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
+                            />
+                          </button>
+                          <span className="font-bold text-yellow-200 tabular-nums">#{order.id.slice(0, 8)}</span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-500/20 text-green-300 border border-green-500/40 capitalize shrink-0">
+                            {statusLabel}
+                          </span>
+                          <span className="text-sm text-gray-200 truncate max-w-[10rem] sm:max-w-[14rem] min-w-0">
+                            {customer?.full_name || 'Unknown'}
+                          </span>
+                          <span className="text-[11px] text-gray-500 shrink-0 hidden sm:inline whitespace-nowrap">
+                            {placedShort}
+                          </span>
+                          <span className="text-sm font-semibold text-yellow-300 ml-auto shrink-0 tabular-nums">
+                            ₱{order.final_amount.toFixed(2)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void deleteArchivedOrder(order);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-xs font-semibold bg-red-700/90 text-white hover:bg-red-600 transition-all shrink-0"
                           >
                             <Trash2 className="w-3 h-3" />
-                            Delete
+                            <span className="hidden sm:inline">Delete</span>
                           </button>
                         </div>
+                        {expanded ? (
+                          <div className="border-t border-yellow-500/15 bg-black/35 px-3 sm:px-4 pb-4 pt-3 space-y-4">
+                            <p className="text-xs text-gray-500 font-mono break-all">
+                              Order ID: {order.id}
+                            </p>
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div>
+                                <p className="text-sm font-semibold text-gray-400">Customer name</p>
+                                <p className="text-lg font-bold text-yellow-100 mt-1 break-words">
+                                  {customer?.full_name || 'Unknown customer'}
+                                </p>
+                              </div>
+                              <span className="px-2.5 py-1 rounded-full text-xs font-semibold border border-yellow-500/40 bg-black/40 text-gray-200">
+                                {order.order_items?.length ?? 0} item
+                                {(order.order_items?.length ?? 0) !== 1 ? 's' : ''}
+                              </span>
+                            </div>
+                            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 text-base">
+                              <div>
+                                <p className="text-sm font-semibold text-gray-400">Placed</p>
+                                <p className="text-gray-200 mt-1">
+                                  {new Date(order.created_at).toLocaleString(undefined, {
+                                    year: 'numeric',
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: 'numeric',
+                                    minute: '2-digit',
+                                  })}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-sm font-semibold text-gray-400">Archived</p>
+                                <p className="text-gray-200 mt-1 text-sm">
+                                  {order.archived_at
+                                    ? new Date(order.archived_at).toLocaleString(undefined, {
+                                        year: 'numeric',
+                                        month: 'short',
+                                        day: 'numeric',
+                                        hour: 'numeric',
+                                        minute: '2-digit',
+                                      })
+                                    : '—'}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-sm font-semibold text-gray-400">Payment</p>
+                                <p className="text-gray-200 mt-1 font-semibold">{order.payment_method}</p>
+                              </div>
+                              <div>
+                                <p className="text-sm font-semibold text-gray-400">Updated</p>
+                                <p className="text-gray-400 mt-1 text-sm">
+                                  {new Date(order.updated_at).toLocaleString(undefined, {
+                                    year: 'numeric',
+                                    month: 'short',
+                                    day: 'numeric',
+                                    hour: 'numeric',
+                                    minute: '2-digit',
+                                  })}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="rounded-xl border border-yellow-500/15 bg-black/30 p-3 md:p-4">
+                              <div className="flex items-center justify-between gap-3 mb-3">
+                                <p className="text-sm font-semibold text-gray-200">Items</p>
+                                <p className="text-sm text-gray-400">
+                                  {order.order_items?.length ?? 0} line
+                                  {(order.order_items?.length ?? 0) !== 1 ? 's' : ''}
+                                </p>
+                              </div>
+                              <div className="space-y-2 max-h-[280px] overflow-auto pr-1">
+                                {(order.order_items ?? []).map((item) => {
+                                  const menuItem = menuItems.find((m) => m.id === item.menu_item_id);
+                                  return (
+                                    <div
+                                      key={item.id}
+                                      className="flex items-center justify-between gap-3 rounded-lg bg-black/40 px-3 py-2.5"
+                                    >
+                                      <div className="flex items-center gap-3 min-w-0">
+                                        {menuItem && (
+                                          <img
+                                            src={menuItem.image_url}
+                                            alt={item.menu_item_name}
+                                            className="w-16 h-16 rounded-lg object-cover border border-yellow-500/30"
+                                          />
+                                        )}
+                                        <div className="min-w-0">
+                                          <p className="text-base text-gray-100 leading-snug break-words">
+                                            <span className="text-gray-300 font-semibold">{item.quantity}×</span>{' '}
+                                            {item.menu_item_name}
+                                          </p>
+                                          <p className="text-sm text-gray-400 mt-0.5">₱{item.price.toFixed(2)} each</p>
+                                        </div>
+                                      </div>
+                                      <p className="text-base font-semibold text-yellow-200 whitespace-nowrap">
+                                        ₱{item.subtotal.toFixed(2)}
+                                      </p>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                            <div className="pt-3 border-t border-yellow-500/15 flex items-end justify-between gap-3">
+                              <div className="text-sm text-gray-300 min-w-0 space-y-1.5">
+                                <p className="font-semibold text-gray-200 text-base">Summary</p>
+                                <p className="text-sm text-gray-400">
+                                  Order total (subtotal):{' '}
+                                  <span className="text-yellow-200 tabular-nums font-medium">₱{order.total_amount.toFixed(2)}</span>
+                                </p>
+                                {order.discount_amount > 0 ? (
+                                  <div className="space-y-1">
+                                    {order.discount_amount - (order.wallet_discount_amount ?? 0) > 0.001 && (
+                                      <p className="text-sm text-green-300">
+                                        Promo discount: -₱
+                                        {(order.discount_amount - (order.wallet_discount_amount ?? 0)).toFixed(2)}
+                                      </p>
+                                    )}
+                                    {(order.wallet_discount_amount ?? 0) > 0.001 && (
+                                      <p className="text-sm text-emerald-300">
+                                        Wallet discount: -₱{(order.wallet_discount_amount ?? 0).toFixed(2)}
+                                      </p>
+                                    )}
+                                    <p className="text-sm text-gray-400">
+                                      Total discount: -₱{order.discount_amount.toFixed(2)}
+                                    </p>
+                                  </div>
+                                ) : (
+                                  <p className="text-sm text-gray-500">No discount</p>
+                                )}
+                              </div>
+                              <div className="text-right shrink-0">
+                                <p className="text-sm text-gray-400">Discounted total</p>
+                                <p className="text-2xl md:text-3xl font-extrabold text-yellow-300 leading-tight tabular-nums">
+                                  ₱{order.final_amount.toFixed(2)}
+                                </p>
+                              </div>
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
             )}
           </section>
@@ -2679,21 +3194,28 @@ export default function AdminPage() {
               <ImageIcon className="w-5 h-5 text-yellow-400" />
               <h2 className="text-xl font-bold text-yellow-300">Gallery Images</h2>
             </div>
-            <p className="text-sm text-gray-300 mb-4">
-              Upload up to <strong>10</strong> photos. These appear in the public gallery
-              carousel.
+            <p className="text-sm text-gray-300 mb-2">
+              Upload up to <strong>{GALLERY_MAX_IMAGES}</strong> photos. These appear in the public gallery.
+            </p>
+            <p className="text-xs text-gray-500 mb-4">
+              Images are automatically compressed to WebP (max ~1200px, target under ~380KB) to save Supabase
+              storage.
             </p>
 
-            <div className="flex flex-col md:flex-row md:items-center gap-4 mb-6">
+            <div className="flex flex-col md:flex-row md:items-center gap-4 mb-4">
               <input
                 type="file"
                 accept="image/*"
-                onChange={(e) => handleGalleryUpload(e.target.files?.[0] || null)}
+                onChange={(e) => {
+                  const f = e.target.files?.[0] || null;
+                  void handleGalleryUpload(f);
+                  e.target.value = '';
+                }}
                 className="w-full md:w-auto text-sm text-gray-200"
-                disabled={uploadingImage}
+                disabled={uploadingImage || deletingGallery}
               />
               <p className="text-xs text-gray-400">
-                {galleryImages.length}/10 images uploaded
+                {galleryImages.length}/{GALLERY_MAX_IMAGES} images uploaded
               </p>
             </div>
 
@@ -2706,20 +3228,116 @@ export default function AdminPage() {
                 No images yet. Upload your first gallery photo.
               </p>
             ) : (
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                {galleryImages.map((img) => (
-                  <div
-                    key={img.id}
-                    className="relative aspect-square rounded-lg overflow-hidden bg-black/40 border border-yellow-500/30"
-                  >
-                    <img
-                      src={img.image_url}
-                      alt="Gallery"
-                      className="w-full h-full object-cover"
-                    />
+              <>
+                <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2 sm:gap-3 mb-4">
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setGallerySelectedIds(new Set(galleryImages.map((g) => g.id)))}
+                      disabled={deletingGallery || gallerySelectedIds.size === galleryImages.length}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-yellow-500/40 text-yellow-200 hover:bg-yellow-500/10 disabled:opacity-40 transition-colors"
+                    >
+                      Select all
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setGallerySelectedIds(new Set())}
+                      disabled={deletingGallery || gallerySelectedIds.size === 0}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-yellow-500/40 text-yellow-200 hover:bg-yellow-500/10 disabled:opacity-40 transition-colors"
+                    >
+                      Clear selection
+                    </button>
                   </div>
-                ))}
-              </div>
+                  <div className="flex flex-wrap gap-2 sm:ml-auto">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        confirmDeleteGalleryIds(
+                          [...gallerySelectedIds],
+                          'Delete selected photos',
+                          `Remove ${gallerySelectedIds.size} selected image(s) from the gallery and storage?`
+                        )
+                      }
+                      disabled={deletingGallery || gallerySelectedIds.size === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/40 hover:bg-red-500/30 disabled:opacity-40 transition-colors"
+                    >
+                      {deletingGallery ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Trash2 className="w-3.5 h-3.5" />
+                      )}
+                      Delete selected ({gallerySelectedIds.size})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        confirmDeleteGalleryIds(
+                          galleryImages.map((g) => g.id),
+                          'Delete all gallery photos',
+                          `Remove all ${galleryImages.length} image(s) from the gallery and storage? This cannot be undone.`
+                        )
+                      }
+                      disabled={deletingGallery}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-red-600/30 text-red-100 border border-red-500/50 hover:bg-red-600/50 disabled:opacity-40 transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Delete all
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {galleryImages.map((img) => {
+                    const selected = gallerySelectedIds.has(img.id);
+                    return (
+                      <div
+                        key={img.id}
+                        className={`relative aspect-square rounded-lg overflow-hidden bg-black/40 border transition-colors ${
+                          selected ? 'border-yellow-400 ring-2 ring-yellow-400/50' : 'border-yellow-500/30'
+                        }`}
+                      >
+                        <label className="absolute left-2 top-2 z-10 flex cursor-pointer items-center justify-center rounded-md bg-black/70 p-1.5 ring-1 ring-yellow-500/40 hover:bg-black/90">
+                          <input
+                            type="checkbox"
+                            checked={selected}
+                            disabled={deletingGallery}
+                            onChange={() =>
+                              setGallerySelectedIds((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(img.id)) next.delete(img.id);
+                                else next.add(img.id);
+                                return next;
+                              })
+                            }
+                            className="h-4 w-4 rounded border-yellow-500/60 text-yellow-500 focus:ring-yellow-400"
+                            aria-label="Select for deletion"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            confirmDeleteGalleryIds(
+                              [img.id],
+                              'Delete photo',
+                              'Remove this image from the gallery and storage?'
+                            )
+                          }
+                          disabled={deletingGallery}
+                          className="absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-md bg-black/70 text-red-300 ring-1 ring-red-500/40 hover:bg-red-950/80 disabled:opacity-40 transition-colors"
+                          aria-label="Delete this photo"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                        <img
+                          src={img.image_url}
+                          alt="Gallery"
+                          className="w-full h-full object-cover"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
             )}
           </section>
         )}
@@ -3093,6 +3711,85 @@ export default function AdminPage() {
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'activity' && (
+          <section className="bg-neutral-900 rounded-xl shadow-lg p-4 md:p-6 border border-yellow-500/30">
+            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+              <div className="flex items-center gap-2">
+                <History className="w-5 h-5 text-yellow-400 shrink-0" />
+                <div>
+                  <h2 className="text-2xl font-bold text-yellow-300">Activity log</h2>
+                  <p className="text-sm md:text-base text-gray-400 mt-1 leading-snug">
+                    Who changed orders, deleted data, updated payments, promos, and users.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void fetchActivityLogs()}
+                className="shrink-0 px-4 py-2.5 rounded-xl border border-yellow-500/35 bg-black/40 text-base font-semibold text-yellow-200 hover:bg-yellow-500/10 transition-colors"
+              >
+                Refresh
+              </button>
+            </div>
+
+            {activityLoading ? (
+              <div className="flex justify-center py-12">
+                <Loader2 className="w-7 h-7 text-yellow-400 animate-spin" />
+              </div>
+            ) : activityLogs.length === 0 ? (
+              <p className="text-gray-400 text-center py-8 text-base leading-relaxed max-w-lg mx-auto">
+                No entries yet. Apply the Supabase migration for <code className="text-yellow-200/90">admin_activity_log</code>, then
+                perform an action (e.g. change an order status) and refresh.
+              </p>
+            ) : (
+              <div className="overflow-x-auto max-h-[min(70vh,560px)] overflow-y-auto rounded-xl border border-yellow-500/15">
+                <table className="min-w-full text-left text-base">
+                  <thead className="sticky top-0 z-10 bg-neutral-950/95 backdrop-blur-sm border-b border-yellow-500/20 text-sm uppercase tracking-wide text-gray-300">
+                    <tr>
+                      <th className="px-4 py-3 font-semibold whitespace-nowrap">When</th>
+                      <th className="px-4 py-3 font-semibold whitespace-nowrap">Admin</th>
+                      <th className="px-4 py-3 font-semibold whitespace-nowrap">Action</th>
+                      <th className="px-4 py-3 font-semibold min-w-[14rem]">Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-yellow-500/10">
+                    {activityLogs.map((row) => (
+                      <tr key={row.id} className="bg-black/20 hover:bg-black/35 align-top">
+                        <td className="px-4 py-3 text-sm md:text-base text-gray-300 whitespace-nowrap tabular-nums">
+                          {new Date(row.created_at).toLocaleString(undefined, {
+                            year: 'numeric',
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                            second: '2-digit',
+                          })}
+                        </td>
+                        <td className="px-4 py-3 text-gray-200">
+                          <div className="font-semibold text-yellow-100 text-base leading-snug">{row.admin_name}</div>
+                          <div className="text-sm text-gray-400 break-all mt-0.5">{row.admin_email}</div>
+                        </td>
+                        <td className="px-4 py-3 text-sm md:text-base font-medium text-emerald-200">
+                          {formatActivityActionLabel(row.action)}
+                        </td>
+                        <td className="px-4 py-3 text-sm md:text-base text-gray-100 break-words max-w-[28rem] leading-snug">
+                          {row.summary}
+                          {row.resource_id ? (
+                            <span className="block text-xs text-gray-400 mt-1 font-mono break-all">
+                              {row.resource_type ? `${row.resource_type}: ` : ''}
+                              {row.resource_id}
+                            </span>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </section>

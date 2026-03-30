@@ -43,6 +43,20 @@ export type AdminProfile = {
   is_active: boolean;
 };
 
+/** Row in `admin_activity_log` (admin audit trail). */
+export type AdminActivityLog = {
+  id: string;
+  created_at: string;
+  admin_id: string;
+  admin_email: string;
+  admin_name: string;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  summary: string;
+  metadata: Record<string, unknown>;
+};
+
 export type MenuItem = {
   id: string;
   name: string;
@@ -62,6 +76,7 @@ export type Order = {
   user_id: string;
   total_amount: number;
   discount_amount: number;
+  wallet_discount_amount?: number;
   final_amount: number;
   payment_method: 'COD' | 'GCash' | 'Maya' | 'PayPal';
   payment_reference: string | null;
@@ -90,7 +105,8 @@ export type PaymentMethodSetting = {
 export type OrderItem = {
   id: string;
   order_id: string;
-  menu_item_id: string;
+  /** Null if the menu product was deleted; line still has `menu_item_name` and prices. */
+  menu_item_id: string | null;
   menu_item_name: string;
   quantity: number;
   price: number;

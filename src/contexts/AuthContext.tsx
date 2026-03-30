@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
 import { User } from '@supabase/supabase-js';
 import { supabase, CustomerProfile, AdminProfile } from '../lib/supabase';
+import { formatSupabaseError } from '../lib/formatSupabaseError';
 
 type AuthContextType = {
   user: User | null;
@@ -111,7 +112,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             is_active: false,
           },
         ]);
-        if (adminInsertError) throw adminInsertError;
+        if (adminInsertError) {
+          throw new Error(formatSupabaseError(adminInsertError, 'Could not create admin profile.'));
+        }
       } else {
         // Customer sign-up
         const normalizedUsername = (userData.username || '').trim().toLowerCase();
@@ -125,7 +128,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             email,
           },
         ]);
-        if (customerError) throw customerError;
+        if (customerError) {
+          throw new Error(formatSupabaseError(customerError, 'Could not create your profile.'));
+        }
       }
 
       // Ensure UI updates immediately after registration
