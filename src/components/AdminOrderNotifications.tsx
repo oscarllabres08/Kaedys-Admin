@@ -5,7 +5,8 @@ import { extractCustomerInstructionFromNotes } from '../lib/orderNotes';
 
 type OrderInsertRow = {
   id: string;
-  user_id: string;
+  user_id: string | null;
+  order_channel?: string | null;
   final_amount: number;
   payment_method: string;
   delivery_address: string;
@@ -53,6 +54,7 @@ export default function AdminOrderNotifications({
 }: AdminOrderNotificationsProps) {
   const [items, setItems] = useState<NotificationItem[]>([]);
   const [soundUnlocked, setSoundUnlocked] = useState(false);
+  const [soundCardDismissed, setSoundCardDismissed] = useState(false);
   const soundUnlockedRef = useRef(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -203,10 +205,15 @@ export default function AdminOrderNotifications({
 
           const { data } = await query;
           if (data && data.length > 0) {
-            const rows = data as OrderInsertRow[];
-            const newLast = rows[rows.length - 1].created_at;
-            lastSeenCreatedAtRef.current = newLast;
+            const raw = data as OrderInsertRow[];
+            lastSeenCreatedAtRef.current = raw[raw.length - 1].created_at;
 
+            const rows = raw.filter(
+              (row) => !row.order_channel || row.order_channel === 'online'
+            );
+            if (rows.length === 0) {
+              // still advanced lastSeen above; skip notifications for POS-only batch
+            } else {
             const newItems: NotificationItem[] = rows.map((row) => ({
               id: `${row.id}-${row.created_at}`,
               orderId: row.id,
@@ -232,6 +239,7 @@ export default function AdminOrderNotifications({
               } catch {
                 // ignore
               }
+            }
             }
           }
         }
@@ -262,16 +270,39 @@ export default function AdminOrderNotifications({
     return () => timers.forEach((t) => window.clearTimeout(t));
   }, [items]);
 
+  useEffect(() => {
+    if (!enabled) setSoundCardDismissed(false);
+  }, [enabled]);
+
   if (!enabled) return null;
 
   return (
     <div className="fixed top-4 right-4 z-[85] flex w-[min(420px,calc(100vw-2rem))] flex-col gap-3">
-      {!soundUnlocked ? (
+      {soundCardDismissed ? null : !soundUnlocked ? (
         <button
           type="button"
           onClick={() => unlockAudio()}
           className="group relative w-full overflow-hidden rounded-2xl border-2 border-yellow-400/55 bg-gradient-to-br from-yellow-500/[0.12] via-neutral-950/95 to-neutral-950/95 px-3 py-3 text-left shadow-[0_0_28px_rgba(250,204,21,0.12)] backdrop-blur transition-all hover:border-yellow-400/90 hover:shadow-[0_0_36px_rgba(250,204,21,0.22)] active:scale-[0.99] focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400/80 sm:px-4 sm:py-3.5"
         >
+          <span
+            role="button"
+            tabIndex={0}
+            aria-label="Close sound notice"
+            onClick={(e) => {
+              // Requirement: sound must be enabled before closing.
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+            }}
+            className="absolute right-3 top-3 rounded-lg p-1.5 text-gray-200/70 hover:text-white hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400/60"
+          >
+            <X className="h-4 w-4" />
+          </span>
           <span
             className="pointer-events-none absolute inset-0 rounded-2xl ring-2 ring-yellow-400/25 ring-offset-0 ring-offset-transparent animate-pulse"
             aria-hidden
@@ -307,8 +338,16 @@ export default function AdminOrderNotifications({
         <div
           role="status"
           aria-live="polite"
-          className="flex w-full items-start gap-3 rounded-2xl border border-emerald-500/45 bg-gradient-to-br from-emerald-500/[0.14] via-neutral-950/95 to-neutral-950/95 px-3 py-2.5 shadow-[0_0_20px_rgba(16,185,129,0.12)] backdrop-blur sm:px-4 sm:py-3"
+          className="relative flex w-full items-start gap-3 rounded-2xl border border-emerald-500/45 bg-gradient-to-br from-emerald-500/[0.14] via-neutral-950/95 to-neutral-950/95 px-3 py-2.5 shadow-[0_0_20px_rgba(16,185,129,0.12)] backdrop-blur sm:px-4 sm:py-3"
         >
+          <button
+            type="button"
+            aria-label="Close sound notice"
+            onClick={() => setSoundCardDismissed(true)}
+            className="absolute right-3 top-3 rounded-lg p-1.5 text-gray-200/70 hover:text-white hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/60"
+          >
+            <X className="h-4 w-4" />
+          </button>
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-emerald-500/35 bg-emerald-500/15">
             <Volume2 className="h-5 w-5 text-emerald-300" aria-hidden />
           </div>

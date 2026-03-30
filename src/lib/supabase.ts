@@ -4,14 +4,15 @@ const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 const kind = import.meta.env.VITE_APP_KIND;
-if (kind !== 'admin') {
-  throw new Error(`AdminWebsite requires VITE_APP_KIND=admin (received ${String(kind)})`);
-}
-if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error('Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY in AdminWebsite environment.');
-}
+const isAdminApp =
+  kind === 'admin' ||
+  (kind !== 'user' &&
+    typeof document !== 'undefined' &&
+    document.getElementById('admin-root') !== null);
 
-const storageKey = 'kaedys_sb_admin_auth';
+// Use different auth storage keys so admin/public sessions don't overwrite each other
+// when opened in different tabs of the same browser.
+const storageKey = isAdminApp ? 'kaedys_sb_admin_auth' : 'kaedys_sb_public_auth';
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
   auth: {
@@ -32,6 +33,12 @@ export type CustomerProfile = {
   suspended_until?: string | null;
   suspension_reason?: string | null;
   created_at: string;
+  /** Lifetime points from the math game */
+  game_score_total?: number;
+  /** Points available to redeem (50 pts = ₱1) */
+  game_score_balance?: number;
+  /** PHP wallet from redeeming points; usable at checkout */
+  peso_balance?: number;
 };
 
 export type AdminProfile = {
@@ -67,18 +74,28 @@ export type MenuItem = {
   custom_category?: string | null;
   subcategory?: string | null;
   is_available: boolean;
+  /** On-hand units when track_stock is true */
+  stock_quantity?: number;
+  /** When true, sales decrement stock_quantity */
+  track_stock?: boolean;
   display_order?: number;
   created_at: string;
 };
 
 export type Order = {
   id: string;
-  user_id: string;
+  /** Null for walk-in POS orders */
+  user_id: string | null;
   total_amount: number;
   discount_amount: number;
+  /** Part of discount_amount paid from customer peso wallet */
   wallet_discount_amount?: number;
   final_amount: number;
-  payment_method: 'COD' | 'GCash' | 'Maya' | 'PayPal';
+  payment_method: 'COD' | 'GCash' | 'Maya' | 'PayPal' | 'Cash';
+  /** Where the order was placed */
+  order_channel?: 'online' | 'pos';
+  /** Admin who rang up a POS sale */
+  pos_sold_by_admin_id?: string | null;
   payment_reference: string | null;
   payment_proof_url: string | null;
   status: 'pending' | 'confirmed' | 'preparing' | 'on_the_way' | 'completed' | 'cancelled';
@@ -162,6 +179,7 @@ export type GameSettings = {
   updated_at: string;
 };
 
+/** Singleton row `id = 1` — official GCash QR object path in Storage bucket `gcash-qr` */
 export type SiteSettings = {
   id: number;
   gcash_qr_storage_path: string | null;

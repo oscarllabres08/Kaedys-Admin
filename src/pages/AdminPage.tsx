@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   supabase,
   AdminProfile,
@@ -47,7 +47,13 @@ import {
   X,
   LogOut,
   History,
+  Store,
+  Package,
+  TrendingUp,
 } from 'lucide-react';
+const PosTerminal = lazy(() => import('../components/admin/PosTerminal'));
+const InventoryPanel = lazy(() => import('../components/admin/InventoryPanel'));
+const SalesReportsPanel = lazy(() => import('../components/admin/SalesReportsPanel'));
 
 type OrderWithItems = Order & {
   order_items: OrderItem[];
@@ -57,6 +63,9 @@ type TabId =
   | 'orders'
   | 'archived'
   | 'menu'
+  | 'pos'
+  | 'inventory'
+  | 'sales'
   | 'announcements'
   | 'gallery'
   | 'gcash'
@@ -90,6 +99,9 @@ function isTabId(value: string): value is TabId {
     value === 'orders' ||
     value === 'archived' ||
     value === 'menu' ||
+    value === 'pos' ||
+    value === 'inventory' ||
+    value === 'sales' ||
     value === 'announcements' ||
     value === 'gallery' ||
     value === 'gcash' ||
@@ -225,6 +237,7 @@ async function sendStatusEmail(order: Order, newStatus: Order['status']) {
 
 const GALLERY_MAX_IMAGES = 15;
 
+/** Extract storage object path from Supabase public URL for bucket `gallery`. */
 function galleryObjectPathFromPublicUrl(imageUrl: string): string | null {
   try {
     const u = new URL(imageUrl);
@@ -247,6 +260,7 @@ export default function AdminPage() {
     return 'orders';
   });
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [logoBroken, setLogoBroken] = useState(false);
   const [paymentProofLightboxUrl, setPaymentProofLightboxUrl] = useState<string | null>(null);
   const [activityLogs, setActivityLogs] = useState<AdminActivityLog[]>([]);
   const [activityLoading, setActivityLoading] = useState(false);
@@ -285,7 +299,7 @@ export default function AdminPage() {
   const [menuSearch, setMenuSearch] = useState('');
   const [menuCategory, setMenuCategory] = useState<string>('All');
   const [menuForm, setMenuForm] = useState({
-    category: '',
+    category: 'Pizza',
     custom_category: '',
     subcategory: '',
     name: '',
@@ -293,7 +307,20 @@ export default function AdminPage() {
     price: '',
     imageFile: null as File | null,
     image_url: '',
+    stock_quantity: '0',
+    // Default ON so admin can immediately input stock quantity.
+    track_stock: true,
   });
+  const [showMenuStockQty, setShowMenuStockQty] = useState(true);
+
+  const mainCategoryOptions = useMemo(() => {
+    const set = new Set(
+      menuItems
+        .map((m) => m.category)
+        .filter((c): c is string => !!c && c.trim().length > 0 && c !== 'Others')
+    );
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [menuItems]);
 
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [annLoading, setAnnLoading] = useState(false);
@@ -332,6 +359,7 @@ export default function AdminPage() {
   const [admins, setAdmins] = useState<AdminProfile[]>([]);
   const [adminsLoading, setAdminsLoading] = useState(false);
   const [customersById, setCustomersById] = useState<Record<string, CustomerProfile>>({});
+  const [posAdminsById, setPosAdminsById] = useState<Record<string, { full_name: string }>>({});
   const [managedUsers, setManagedUsers] = useState<CustomerProfile[]>([]);
   const [usersLoading, setUsersLoading] = useState(false);
   const [noticeModal, setNoticeModal] = useState<{
@@ -483,6 +511,24 @@ export default function AdminPage() {
       } else {
         setCustomersById({});
       }
+
+      const posIds = Array.from(
+        new Set(ordersData.map((o) => o.pos_sold_by_admin_id).filter(Boolean) as string[])
+      );
+      if (posIds.length > 0) {
+        const { data: admins, error: admErr } = await supabase
+          .from('admin_profiles')
+          .select('id, full_name')
+          .in('id', posIds);
+        if (admErr) throw admErr;
+        const amap: Record<string, { full_name: string }> = {};
+        for (const a of admins || []) {
+          amap[a.id] = { full_name: a.full_name };
+        }
+        setPosAdminsById(amap);
+      } else {
+        setPosAdminsById({});
+      }
     } catch (error) {
       console.error('Error loading orders', error);
     } finally {
@@ -530,6 +576,24 @@ export default function AdminPage() {
           map[c.id] = c as CustomerProfile;
         }
         setCustomersById((prev) => ({ ...prev, ...map }));
+      }
+
+      const posIdsA = Array.from(
+        new Set(archived.map((o) => o.pos_sold_by_admin_id).filter(Boolean) as string[])
+      );
+      if (posIdsA.length > 0) {
+        const { data: admins, error: admErr } = await supabase
+          .from('admin_profiles')
+          .select('id, full_name')
+          .in('id', posIdsA);
+        if (admErr) throw admErr;
+        setPosAdminsById((prev) => {
+          const next = { ...prev };
+          for (const a of admins || []) {
+            next[a.id] = { full_name: a.full_name };
+          }
+          return next;
+        });
       }
     } catch (error) {
       console.error('Error loading archived orders', error);
@@ -799,6 +863,19 @@ export default function AdminPage() {
     };
     window.addEventListener('kaedys:new-order', handler as EventListener);
     return () => window.removeEventListener('kaedys:new-order', handler as EventListener);
+  }, [activeTab, fetchOrders]);
+
+  // If admin switches to Orders after a new order arrived (while viewing another tab),
+  // fetch again so the new order is visible without manual refresh.
+  const hasRunOrdersTabRefreshEffectRef = useRef(false);
+  useEffect(() => {
+    if (!hasRunOrdersTabRefreshEffectRef.current) {
+      hasRunOrdersTabRefreshEffectRef.current = true;
+      return;
+    }
+    if (activeTab === 'orders') {
+      fetchOrders();
+    }
   }, [activeTab, fetchOrders]);
 
   useEffect(() => {
@@ -1417,6 +1494,35 @@ export default function AdminPage() {
         openNoticeModal('Action blocked', 'You cannot deactivate the Master Admin account.', 'info');
         return;
       }
+
+      // "Decline" is shown only for pending admins (not master).
+      // When declined, auto-delete the admin account so it disappears from the approval page.
+      if (!makeActive && !admin.is_active) {
+        const ok = await askConfirm(
+          'Decline admin access',
+          `Decline ${admin.full_name} and permanently delete their admin account?`,
+          'Decline',
+          'Cancel'
+        );
+        if (!ok) return;
+
+        const { error } = await supabase.rpc('master_admin_delete_admin_account', {
+          p_admin_id: admin.id,
+        });
+        if (error) throw error;
+
+        await fetchAdmins();
+        openNoticeModal('Admin declined', 'Admin account deleted.', 'success');
+        logActivity({
+          action: 'admin.approval_updated',
+          resourceType: 'admin_profile',
+          resourceId: admin.id,
+          summary: `Declined and deleted admin: ${admin.full_name} (${admin.email})`,
+          metadata: { declined: true },
+        });
+        return;
+      }
+
       const { error } = await supabase
         .from('admin_profiles')
         .update({ is_active: makeActive })
@@ -1483,6 +1589,28 @@ export default function AdminPage() {
   const sidebarNav = (
     <div className="space-y-2">
       <button
+        onClick={() => handleSelectTab('pos')}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+          activeTab === 'pos'
+            ? 'bg-yellow-400 text-black shadow-lg'
+            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
+        }`}
+      >
+        <Store className="w-4 h-4" />
+        POS
+      </button>
+      <button
+        onClick={() => handleSelectTab('menu')}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+          activeTab === 'menu'
+            ? 'bg-yellow-400 text-black shadow-lg'
+            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
+        }`}
+      >
+        <Pizza className="w-4 h-4" />
+        Menu
+      </button>
+      <button
         onClick={() => handleSelectTab('orders')}
         className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
           activeTab === 'orders'
@@ -1505,37 +1633,26 @@ export default function AdminPage() {
         Archived Orders
       </button>
       <button
-        onClick={() => handleSelectTab('activity')}
+        onClick={() => handleSelectTab('inventory')}
         className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-          activeTab === 'activity'
+          activeTab === 'inventory'
             ? 'bg-yellow-400 text-black shadow-lg'
             : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
         }`}
       >
-        <History className="w-4 h-4" />
-        Activity log
+        <Package className="w-4 h-4" />
+        Inventory
       </button>
       <button
-        onClick={() => handleSelectTab('menu')}
+        onClick={() => handleSelectTab('sales')}
         className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-          activeTab === 'menu'
+          activeTab === 'sales'
             ? 'bg-yellow-400 text-black shadow-lg'
             : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
         }`}
       >
-        <Pizza className="w-4 h-4" />
-        Menu
-      </button>
-      <button
-        onClick={() => handleSelectTab('announcements')}
-        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
-          activeTab === 'announcements'
-            ? 'bg-yellow-400 text-black shadow-lg'
-            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
-        }`}
-      >
-        <Megaphone className="w-4 h-4" />
-        Promos
+        <TrendingUp className="w-4 h-4" />
+        Sales reports
       </button>
       <button
         onClick={() => handleSelectTab('gallery')}
@@ -1547,6 +1664,17 @@ export default function AdminPage() {
       >
         <ImageIcon className="w-4 h-4" />
         Gallery
+      </button>
+      <button
+        onClick={() => handleSelectTab('announcements')}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+          activeTab === 'announcements'
+            ? 'bg-yellow-400 text-black shadow-lg'
+            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
+        }`}
+      >
+        <Megaphone className="w-4 h-4" />
+        Promos
       </button>
       {isMasterAdmin && (
         <button
@@ -1571,6 +1699,17 @@ export default function AdminPage() {
       >
         <Gamepad2 className="w-4 h-4" />
         Discount Game
+      </button>
+      <button
+        onClick={() => handleSelectTab('activity')}
+        className={`w-full flex items-center gap-2 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+          activeTab === 'activity'
+            ? 'bg-yellow-400 text-black shadow-lg'
+            : 'bg-black/30 text-gray-200 hover:bg-neutral-800'
+        }`}
+      >
+        <History className="w-4 h-4" />
+        Activity log
       </button>
       {isMasterAdmin && (
         <button
@@ -1605,7 +1744,9 @@ export default function AdminPage() {
     try {
       const price = Number(menuForm.price);
       const normalizedSubcategory = toTitleCase(menuForm.subcategory);
-      const normalizedCategory = toTitleCase(menuForm.category);
+      const isOthers = menuForm.category === 'Others';
+      const normalizedCustomCategory = toTitleCase(menuForm.custom_category);
+      const normalizedCategory = isOthers ? 'Others' : toTitleCase(menuForm.category);
       if (!menuForm.name || !menuForm.description || !Number.isFinite(price)) {
         openNoticeModal('Missing fields', 'Please fill out name, description, and a valid price.', 'info');
         return;
@@ -1615,7 +1756,11 @@ export default function AdminPage() {
         return;
       }
       if (!normalizedCategory) {
-        openNoticeModal('Missing category', 'Please enter a main category.', 'info');
+        openNoticeModal('Missing category', 'Please choose a main category.', 'info');
+        return;
+      }
+      if (isOthers && !normalizedCustomCategory) {
+        openNoticeModal('Missing custom category', 'Please type your custom main category for Others.', 'info');
         return;
       }
 
@@ -1638,14 +1783,20 @@ export default function AdminPage() {
         imageUrl = urlData.publicUrl;
       }
 
+      const stockQty = Math.max(0, Math.floor(Number(menuForm.stock_quantity) || 0));
+
+      const customCategoryPayload = isOthers ? normalizedCustomCategory : null;
+
       const payload = {
         name: menuForm.name,
         description: menuForm.description.trim(),
         price,
         category: normalizedCategory,
-        custom_category: null,
+        custom_category: customCategoryPayload,
         subcategory: normalizedSubcategory || null,
         image_url: imageUrl,
+        stock_quantity: stockQty,
+        track_stock: menuForm.track_stock,
       };
 
       if (!payload.image_url) {
@@ -1663,7 +1814,9 @@ export default function AdminPage() {
           summary: `Updated menu item: ${payload.name}`,
         });
       } else {
-        const { error } = await supabase.from('menu_items').insert([{ ...payload, is_available: true }]);
+        const { error } = await supabase
+          .from('menu_items')
+          .insert([{ ...payload, is_available: true }]);
         if (error) throw error;
         logActivity({
           action: 'menu.item_created',
@@ -1785,7 +1938,7 @@ export default function AdminPage() {
   ) : null;
 
   return (
-    <div className="min-h-screen w-full max-w-[100vw] overflow-x-hidden bg-gradient-to-br from-black to-neutral-900 pb-8">
+    <div className="min-h-screen bg-gradient-to-br from-black to-neutral-900 pb-8">
       {noticeModalEl}
       {confirmModalEl}
       {paymentProofLightboxUrl ? (
@@ -1819,21 +1972,26 @@ export default function AdminPage() {
       ) : null}
       {/* Top bar */}
       <header className="sticky top-0 z-20 bg-black/80 backdrop-blur border-b border-yellow-500/20">
-        <div className="w-full min-w-0 px-4 md:px-6 py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="h-11 w-11 md:h-12 md:w-12 shrink-0 rounded-full border-2 border-yellow-400 overflow-hidden bg-black">
-              <img
-                src="/assets/kaedypizza.jpg"
-                alt="KaeDy's Pizza Hub Logo"
-                className="h-full w-full object-cover"
-              />
+        <div className="w-full px-4 md:px-6 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="h-11 w-11 md:h-12 md:w-12 rounded-full border-2 border-yellow-400 overflow-hidden bg-black flex items-center justify-center">
+              {logoBroken ? (
+                <span className="text-sm md:text-base font-extrabold text-yellow-200 select-none">KD</span>
+              ) : (
+                <img
+                  src="/assets/kaedypizza.jpg"
+                  alt="KaeDy's Pizza Hub Logo"
+                  className="h-full w-full object-cover"
+                  onError={() => setLogoBroken(true)}
+                  onLoad={() => setLogoBroken(false)}
+                  draggable={false}
+                />
+              )}
             </div>
-            <div className="leading-tight min-w-0">
-              <p className="text-base md:text-lg font-bold text-yellow-300 truncate sm:whitespace-normal">
-                KaeDy&apos;s Pizza Hub
-              </p>
-              <div className="flex flex-wrap items-center gap-2 min-w-0">
-                <p className="text-[11px] md:text-xs text-gray-400 truncate max-w-[min(42vw,12rem)] sm:max-w-none">
+            <div className="leading-tight">
+              <p className="text-base md:text-lg font-bold text-yellow-300">KaeDy&apos;s Pizza Hub</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-[11px] md:text-xs text-gray-400">
                   {adminProfile?.full_name ? `Admin: ${adminProfile.full_name}` : 'Admin Dashboard'}
                 </p>
                 {adminProfile?.full_name && (
@@ -1875,12 +2033,19 @@ export default function AdminPage() {
             <div className="w-72 max-w-[80%] bg-gradient-to-b from-black to-neutral-900 border-l border-yellow-500/40 shadow-[0_0_25px_rgba(0,0,0,0.8)] p-4 flex flex-col gap-4">
               <div className="flex items-center justify-between mb-1">
                 <div className="flex items-center gap-2">
-                  <div className="h-10 w-10 rounded-full border-2 border-yellow-400 overflow-hidden bg-black">
-                    <img
-                      src="/assets/kaedypizza.jpg"
-                      alt="KaeDy's Pizza Hub Logo"
-                      className="h-full w-full object-cover"
-                    />
+                  <div className="h-10 w-10 rounded-full border-2 border-yellow-400 overflow-hidden bg-black flex items-center justify-center">
+                    {logoBroken ? (
+                      <span className="text-xs sm:text-sm font-extrabold text-yellow-200 select-none">KD</span>
+                    ) : (
+                      <img
+                        src="/assets/kaedypizza.jpg"
+                        alt="KaeDy's Pizza Hub Logo"
+                        className="h-full w-full object-cover"
+                        onError={() => setLogoBroken(true)}
+                        onLoad={() => setLogoBroken(false)}
+                        draggable={false}
+                      />
+                    )}
                   </div>
                   <div className="leading-tight">
                     <p className="text-base font-bold text-yellow-300">KaeDy&apos;s Pizza Hub</p>
@@ -1964,6 +2129,46 @@ export default function AdminPage() {
                   <span className="flex items-center gap-2">
                     <Pizza className="w-4 h-4" />
                     Menu
+                  </span>
+                </button>
+
+                <button
+                  onClick={() => handleSelectTab('pos')}
+                  className={`w-full inline-flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold ${
+                    activeTab === 'pos'
+                      ? 'bg-yellow-400 text-black'
+                      : 'bg-neutral-800 text-gray-100'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <Store className="w-4 h-4" />
+                    POS
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleSelectTab('inventory')}
+                  className={`w-full inline-flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold ${
+                    activeTab === 'inventory'
+                      ? 'bg-yellow-400 text-black'
+                      : 'bg-neutral-800 text-gray-100'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <Package className="w-4 h-4" />
+                    Inventory
+                  </span>
+                </button>
+                <button
+                  onClick={() => handleSelectTab('sales')}
+                  className={`w-full inline-flex items-center justify-between px-3 py-2.5 rounded-lg text-sm font-semibold ${
+                    activeTab === 'sales'
+                      ? 'bg-yellow-400 text-black'
+                      : 'bg-neutral-800 text-gray-100'
+                  }`}
+                >
+                  <span className="flex items-center gap-2">
+                    <TrendingUp className="w-4 h-4" />
+                    Sales reports
                   </span>
                 </button>
 
@@ -2071,8 +2276,8 @@ export default function AdminPage() {
         )}
       </header>
 
-      <div className="w-full min-w-0 max-w-[100vw] overflow-x-hidden px-4 md:px-6 pt-6 box-border">
-        <div className="flex gap-6 min-w-0">
+      <div className="w-full px-4 md:px-6 pt-6">
+        <div className="flex gap-6">
           {/* Desktop sidebar */}
           <aside className="hidden md:flex w-64 shrink-0">
             <div className="w-full sticky top-[88px] h-[calc(100vh-104px)] rounded-2xl border border-yellow-500/25 bg-black/30 p-3 flex flex-col">
@@ -2118,14 +2323,32 @@ export default function AdminPage() {
               <div className="p-4 space-y-3">
                 <div>
                   <label className="block text-sm font-medium text-gray-200 mb-1">Main category</label>
-                  <input
-                    type="text"
+                  <select
                     value={menuForm.category}
                     onChange={(e) => setMenuForm((p) => ({ ...p, category: e.target.value }))}
                     className="w-full px-3 py-2 rounded-lg bg-black text-white border border-yellow-500/30"
-                    placeholder="e.g. Pizza, Drinks, Silog Meals"
-                    autoComplete="off"
-                  />
+                  >
+                    {mainCategoryOptions.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                    <option value="Others">Others</option>
+                  </select>
+                  {menuForm.category === 'Others' && (
+                    <div className="mt-3">
+                      <label className="block text-sm font-medium text-gray-200 mb-1">
+                        Others - Custom category
+                      </label>
+                      <input
+                        value={menuForm.custom_category}
+                        onChange={(e) => setMenuForm((p) => ({ ...p, custom_category: e.target.value }))}
+                        className="w-full px-3 py-2 rounded-lg bg-black text-white border border-yellow-500/30"
+                        placeholder="Type the category name (e.g. Vegan Meals)"
+                        autoComplete="off"
+                      />
+                    </div>
+                  )}
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-200 mb-1">
@@ -2181,6 +2404,33 @@ export default function AdminPage() {
                       accept="image/*"
                       onChange={(e) => setMenuForm((p) => ({ ...p, imageFile: e.target.files?.[0] || null }))}
                       className="w-full text-sm text-gray-200"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-200 mb-1">
+                      <input
+                        type="checkbox"
+                        className="accent-yellow-400"
+                        checked={menuForm.track_stock}
+                        onChange={(e) => setMenuForm((p) => ({ ...p, track_stock: e.target.checked }))}
+                      />
+                      Track stock
+                    </label>
+                    <p className="text-[11px] text-gray-500">
+                      When on, online and POS sales reduce this count.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-200 mb-1">Stock quantity</label>
+                    <input
+                      value={menuForm.stock_quantity}
+                      onChange={(e) => setMenuForm((p) => ({ ...p, stock_quantity: e.target.value }))}
+                      className="w-full px-3 py-2 rounded-lg bg-black text-white border border-yellow-500/30 disabled:opacity-50"
+                      inputMode="numeric"
+                      disabled={!menuForm.track_stock}
+                      placeholder="0"
                     />
                   </div>
                 </div>
@@ -2283,7 +2533,8 @@ export default function AdminPage() {
             ) : (
               <div className="space-y-4">
                 {orders.map((order) => {
-                  const customer = customersById[order.user_id];
+                  const customer = order.user_id ? customersById[order.user_id] : null;
+                  const isPosOrder = order.order_channel === 'pos' || order.user_id == null;
                   const instructionNotes = extractCustomerInstructionFromNotes(order.notes);
                   return (
                   <div
@@ -2294,51 +2545,80 @@ export default function AdminPage() {
                       {/* Left: customer info */}
                       <div className="rounded-2xl border border-yellow-500/20 bg-black/30 p-4">
                         <div className="flex items-center gap-3 mb-3">
-                          <p className="text-lg font-bold text-yellow-200">Customer Information</p>
+                          <p className="text-lg font-bold text-yellow-200">
+                            {isPosOrder ? 'Point of sale' : 'Customer Information'}
+                          </p>
                           <span className="ml-auto px-2.5 py-1 rounded-full text-xs font-semibold border border-yellow-500/40 bg-black/40 text-gray-200">
                             {order.order_items.length} item{order.order_items.length !== 1 ? 's' : ''}
                           </span>
                         </div>
 
                         <div className="space-y-3">
-                          <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-sm font-semibold text-gray-400">Name</p>
-                            <p className="mt-1.5 text-base text-gray-100 font-semibold leading-snug break-words">
-                              {customer?.full_name || 'Unknown customer'}
-                            </p>
-                          </div>
+                          {isPosOrder ? (
+                            <>
+                              <div className="rounded-xl border border-sky-500/20 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Channel</p>
+                                <p className="mt-1.5 text-base text-sky-200 font-semibold">Walk-in (POS)</p>
+                              </div>
+                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Cashier</p>
+                                <p className="mt-1.5 text-base text-gray-100 font-semibold">
+                                  {order.pos_sold_by_admin_id
+                                    ? posAdminsById[order.pos_sold_by_admin_id]?.full_name ?? '—'
+                                    : '—'}
+                                </p>
+                              </div>
+                              {order.notes ? (
+                                <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                  <p className="text-sm font-semibold text-gray-400">Notes</p>
+                                  <p className="mt-1.5 text-base text-gray-200 whitespace-pre-wrap break-words">
+                                    {order.notes}
+                                  </p>
+                                </div>
+                              ) : null}
+                            </>
+                          ) : (
+                            <>
+                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Name</p>
+                                <p className="mt-1.5 text-base text-gray-100 font-semibold leading-snug break-words">
+                                  {customer?.full_name || 'Unknown customer'}
+                                </p>
+                              </div>
 
-                          <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-sm font-semibold text-gray-400">Email</p>
-                            <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
-                              {customer?.email || 'No email'}
-                            </p>
-                          </div>
+                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Email</p>
+                                <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
+                                  {customer?.email || 'No email'}
+                                </p>
+                              </div>
 
-                          <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-sm font-semibold text-gray-400">Contact no.</p>
-                            <p className="mt-1.5 text-base text-gray-100 leading-snug break-words">
-                              {order.contact_phone || customer?.phone || 'No phone'}
-                            </p>
-                          </div>
+                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Contact no.</p>
+                                <p className="mt-1.5 text-base text-gray-100 leading-snug break-words">
+                                  {order.contact_phone || customer?.phone || 'No phone'}
+                                </p>
+                              </div>
 
-                          <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                            <p className="text-sm font-semibold text-gray-400">Address</p>
-                            <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
-                              {order.delivery_address || customer?.address || 'No address provided'}
-                            </p>
-                          </div>
+                              <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                <p className="text-sm font-semibold text-gray-400">Address</p>
+                                <p className="mt-1.5 text-base text-gray-200 leading-snug break-words">
+                                  {order.delivery_address || customer?.address || 'No address provided'}
+                                </p>
+                              </div>
 
-                          {instructionNotes ? (
-                            <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
-                              <p className="text-sm font-semibold text-gray-400">
-                                Special instructions
-                              </p>
-                              <p className="mt-1.5 text-base text-gray-200 whitespace-pre-wrap break-words">
-                                {instructionNotes}
-                              </p>
-                            </div>
-                          ) : null}
+                              {instructionNotes ? (
+                                <div className="rounded-xl border border-yellow-500/15 bg-black/25 p-3">
+                                  <p className="text-sm font-semibold text-gray-400">
+                                    Special instructions
+                                  </p>
+                                  <p className="mt-1.5 text-base text-gray-200 whitespace-pre-wrap break-words">
+                                    {instructionNotes}
+                                  </p>
+                                </div>
+                              ) : null}
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -2359,6 +2639,15 @@ export default function AdminPage() {
                               })}
                             </p>
                           </div>
+                          <span
+                            className={`shrink-0 px-2.5 py-1 rounded-full text-xs font-semibold border ${
+                              isPosOrder
+                                ? 'border-sky-500/50 bg-sky-500/15 text-sky-200'
+                                : 'border-emerald-500/50 bg-emerald-500/15 text-emerald-200'
+                            }`}
+                          >
+                            {isPosOrder ? 'POS' : 'Online'}
+                          </span>
                         </div>
 
                         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -2510,9 +2799,9 @@ export default function AdminPage() {
                   <Archive className="w-5 h-5 text-yellow-400" />
                   <h2 className="text-xl font-bold text-yellow-300">Archived Orders</h2>
                 </div>
-                <p className="text-sm text-gray-300 mt-1">
-                  List view: use the arrow to show full order details (items, payment, totals). No contact or address on
-                  this page. Auto-archived orders may be removed after 3 days.
+                <p className="text-base text-gray-300 mt-1">
+                  Summary for reports (customer name, order details, items, discount). No contact or address here.
+                  Auto-archived completed orders may be removed after 3 days.
                 </p>
               </div>
               <button
@@ -2525,7 +2814,7 @@ export default function AdminPage() {
                 Export Excel
               </button>
             </div>
-            <p className="text-xs text-gray-500 mb-4">
+            <p className="text-sm text-gray-500 mb-4">
               Export uses <span className="text-gray-300">all listed orders</span> unless you select rows — then only{' '}
               <span className="text-gray-300">selected</span> orders are included. Downloads an Excel file (.xls):{' '}
               <span className="text-gray-300">one row per order</span> — products and quantities are listed together in one
@@ -2548,21 +2837,21 @@ export default function AdminPage() {
                     <button
                       type="button"
                       onClick={selectAllArchivedOrders}
-                      className="px-3 py-1.5 rounded text-xs font-semibold border border-yellow-500/30 text-yellow-200 hover:bg-yellow-500/10 transition-colors"
+                      className="px-3 py-1.5 rounded text-sm font-semibold border border-yellow-500/30 text-yellow-200 hover:bg-yellow-500/10 transition-colors"
                     >
                       Select all
                     </button>
                     <button
                       type="button"
                       onClick={clearArchivedSelection}
-                      className="px-3 py-1.5 rounded text-xs font-semibold bg-neutral-800 text-gray-100 hover:bg-neutral-700 transition-colors"
+                      className="px-3 py-1.5 rounded text-sm font-semibold bg-neutral-800 text-gray-100 hover:bg-neutral-700 transition-colors"
                     >
                       Clear
                     </button>
                     <button
                       type="button"
                       onClick={exportArchivedCsv}
-                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-xs font-semibold border border-yellow-400/50 text-yellow-200 hover:bg-yellow-500/10 transition-colors"
+                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm font-semibold border border-yellow-400/50 text-yellow-200 hover:bg-yellow-500/10 transition-colors"
                     >
                       <Download className="w-3.5 h-3.5" />
                       Export
@@ -2571,7 +2860,7 @@ export default function AdminPage() {
                       type="button"
                       onClick={deleteSelectedArchivedOrders}
                       disabled={selectedArchivedOrderIds.size === 0 || deletingSelectedArchivedOrders}
-                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-xs font-semibold bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-60"
+                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm font-semibold bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-60"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                       {deletingSelectedArchivedOrders ? 'Deleting...' : 'Delete selected'}
@@ -2580,7 +2869,8 @@ export default function AdminPage() {
                 </div>
                 <div className="rounded-xl border border-yellow-500/20 bg-black/25 overflow-hidden divide-y divide-yellow-500/15">
                   {archivedOrders.map((order) => {
-                    const customer = customersById[order.user_id];
+                    const customer = order.user_id ? customersById[order.user_id] : null;
+                    const isPosOrder = order.order_channel === 'pos' || order.user_id == null;
                     const statusLabel = order.status.replace(/_/g, ' ');
                     const expanded = expandedArchivedOrderIds.has(order.id);
                     const placedShort = new Date(order.created_at).toLocaleString(undefined, {
@@ -2613,13 +2903,15 @@ export default function AdminPage() {
                             />
                           </button>
                           <span className="font-bold text-yellow-200 tabular-nums">#{order.id.slice(0, 8)}</span>
-                          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-green-500/20 text-green-300 border border-green-500/40 capitalize shrink-0">
+                          <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-green-500/20 text-green-300 border border-green-500/40 capitalize shrink-0">
                             {statusLabel}
                           </span>
                           <span className="text-sm text-gray-200 truncate max-w-[10rem] sm:max-w-[14rem] min-w-0">
-                            {customer?.full_name || 'Unknown'}
+                            {isPosOrder
+                              ? `POS · ${posAdminsById[order.pos_sold_by_admin_id ?? '']?.full_name ?? 'Walk-in'}`
+                              : customer?.full_name || 'Unknown'}
                           </span>
-                          <span className="text-[11px] text-gray-500 shrink-0 hidden sm:inline whitespace-nowrap">
+                          <span className="text-sm text-gray-500 shrink-0 hidden xs:inline sm:inline">
                             {placedShort}
                           </span>
                           <span className="text-sm font-semibold text-yellow-300 ml-auto shrink-0 tabular-nums">
@@ -2631,7 +2923,7 @@ export default function AdminPage() {
                               e.stopPropagation();
                               void deleteArchivedOrder(order);
                             }}
-                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-xs font-semibold bg-red-700/90 text-white hover:bg-red-600 transition-all shrink-0"
+                            className="inline-flex items-center gap-1 px-2 py-1.5 rounded-md text-sm font-semibold bg-red-700/90 text-white hover:bg-red-600 transition-all shrink-0"
                           >
                             <Trash2 className="w-3 h-3" />
                             <span className="hidden sm:inline">Delete</span>
@@ -2639,14 +2931,18 @@ export default function AdminPage() {
                         </div>
                         {expanded ? (
                           <div className="border-t border-yellow-500/15 bg-black/35 px-3 sm:px-4 pb-4 pt-3 space-y-4">
-                            <p className="text-xs text-gray-500 font-mono break-all">
+                            <p className="text-sm text-gray-500 font-mono break-all">
                               Order ID: {order.id}
                             </p>
                             <div className="flex flex-wrap items-start justify-between gap-3">
                               <div>
-                                <p className="text-sm font-semibold text-gray-400">Customer name</p>
+                                <p className="text-sm font-semibold text-gray-400">
+                                  {isPosOrder ? 'Point of sale' : 'Customer name'}
+                                </p>
                                 <p className="text-lg font-bold text-yellow-100 mt-1 break-words">
-                                  {customer?.full_name || 'Unknown customer'}
+                                  {isPosOrder
+                                    ? `Walk-in · ${posAdminsById[order.pos_sold_by_admin_id ?? '']?.full_name ?? '—'}`
+                                    : customer?.full_name || 'Unknown customer'}
                                 </p>
                               </div>
                               <span className="px-2.5 py-1 rounded-full text-xs font-semibold border border-yellow-500/40 bg-black/40 text-gray-200">
@@ -2791,25 +3087,39 @@ export default function AdminPage() {
               <Pizza className="w-5 h-5 text-yellow-400" />
               <h2 className="text-xl font-bold text-yellow-300">Menu Availability</h2>
               </div>
-              <button
-                onClick={() => {
-                  setEditingMenuItem(null);
-                  setMenuForm({
-                    category: '',
-                    custom_category: '',
-                    subcategory: '',
-                    name: '',
-                    description: '',
-                    price: '',
-                    imageFile: null,
-                    image_url: '',
-                  });
-                  setMenuModalOpen(true);
-                }}
-                className="px-4 py-2 rounded-lg bg-yellow-400 text-black text-sm font-semibold hover:bg-yellow-300 transition-all"
-              >
-                + Add Product
-              </button>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={showMenuStockQty}
+                    onChange={(e) => setShowMenuStockQty(e.target.checked)}
+                    className="accent-yellow-400"
+                  />
+                  <span className="text-xs font-semibold text-gray-200">Show QTY</span>
+                </label>
+                <button
+                  onClick={() => {
+                    setEditingMenuItem(null);
+                    setMenuForm({
+                      category: mainCategoryOptions[0] ?? 'Others',
+                      custom_category: '',
+                      subcategory: '',
+                      name: '',
+                      description: '',
+                      price: '',
+                      imageFile: null,
+                      image_url: '',
+                      stock_quantity: '0',
+                      // Default ON so admin can immediately input stock quantity.
+                      track_stock: true,
+                    });
+                    setMenuModalOpen(true);
+                  }}
+                  className="px-4 py-2 rounded-lg bg-yellow-400 text-black text-sm font-semibold hover:bg-yellow-300 transition-all"
+                >
+                  + Add Product
+                </button>
+              </div>
             </div>
             <p className="text-sm text-gray-300 mb-4">
               Add, edit, and toggle availability. The public menu is loaded from the database.
@@ -2888,6 +3198,11 @@ export default function AdminPage() {
                           >
                             {item.is_available ? 'Available' : 'Unavailable'}
                           </span>
+                          {showMenuStockQty && item.track_stock ? (
+                            <span className="absolute bottom-1.5 left-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border border-white/25 bg-black/75 text-gray-100 backdrop-blur">
+                              Qty {item.stock_quantity ?? 0}
+                            </span>
+                          ) : null}
                         </div>
                       </div>
 
@@ -2943,14 +3258,19 @@ export default function AdminPage() {
                               : item.category;
                           setEditingMenuItem(item);
                           setMenuForm({
-                            category: resolvedCategory,
-                            custom_category: '',
+                            category:
+                              item.category === 'Others'
+                                ? 'Others'
+                                : resolvedCategory || mainCategoryOptions[0] || 'Others',
+                            custom_category: item.category === 'Others' ? (item.custom_category?.trim() || '') : '',
                             subcategory: item.subcategory || '',
                             name: item.name,
                             description: item.description,
                             price: String(item.price),
                             imageFile: null,
                             image_url: item.image_url,
+                            stock_quantity: String(item.stock_quantity ?? 0),
+                            track_stock: item.track_stock ?? false,
                           });
                           setMenuModalOpen(true);
                         }}
@@ -2973,6 +3293,34 @@ export default function AdminPage() {
           </section>
         )}
 
+        {activeTab === 'pos' && (
+          <section className="bg-neutral-900 rounded-xl shadow-lg p-4 md:p-6 border border-yellow-500/30">
+            <div className="flex items-center gap-2 mb-4">
+              <Store className="w-5 h-5 text-yellow-400" />
+              <h2 className="text-2xl font-bold text-yellow-300">Point of sale</h2>
+            </div>
+            <p className="text-base text-gray-400 mb-4">
+              Walk-in sales use the same stock as online ordering. Each completed sale is recorded immediately for
+              reports.
+            </p>
+            <Suspense fallback={<div className="text-gray-400">Loading POS...</div>}>
+              <PosTerminal menuItems={menuItems} onSaleComplete={() => void fetchMenuItems()} />
+            </Suspense>
+          </section>
+        )}
+
+        {activeTab === 'inventory' && (
+          <Suspense fallback={<div className="text-gray-400">Loading inventory...</div>}>
+            <InventoryPanel menuItems={menuItems} onMenuChanged={() => void fetchMenuItems()} />
+          </Suspense>
+        )}
+
+        {activeTab === 'sales' && (
+          <Suspense fallback={<div className="text-gray-400">Loading sales...</div>}>
+            <SalesReportsPanel />
+          </Suspense>
+        )}
+
         {activeTab === 'announcements' && (
           <section className="bg-neutral-900 rounded-xl shadow-lg p-4 md:p-6 border border-yellow-500/30">
             <div className="flex items-center gap-2 mb-4">
@@ -2984,11 +3332,11 @@ export default function AdminPage() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
               <div className="md:col-span-1 border border-dashed border-yellow-500/60 rounded-lg p-4 bg-black/40">
-                <h3 className="font-semibold text-yellow-300 mb-2">New promo</h3>
-                <p className="text-[11px] text-gray-500 mb-3 leading-snug">
+                <h3 className="text-lg font-semibold text-yellow-300 mb-2">New promo</h3>
+                <p className="text-sm text-gray-500 mb-3 leading-snug">
                   Choose where this promo appears on the customer home page:
                 </p>
-                <ul className="text-[11px] text-gray-500 mb-3 list-disc pl-4 space-y-1 leading-snug">
+                <ul className="text-sm text-gray-500 mb-3 list-disc pl-4 space-y-1 leading-snug">
                   <li>
                     <span className="text-gray-400">Promo update</span> — the promo card (megaphone) and the
                     announcements list on large screens.
@@ -2999,7 +3347,7 @@ export default function AdminPage() {
                   </li>
                 </ul>
                 <div className="mb-3 space-y-2">
-                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-sm text-gray-200 hover:border-yellow-500/40">
+                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-base text-gray-200 hover:border-yellow-500/40">
                     <input
                       type="radio"
                       name="promo_type"
@@ -3011,7 +3359,7 @@ export default function AdminPage() {
                     />
                     <span>Promo update (card and announcements)</span>
                   </label>
-                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-sm text-gray-200 hover:border-yellow-500/40">
+                  <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-yellow-500/20 bg-black/30 p-2 text-base text-gray-200 hover:border-yellow-500/40">
                     <input
                       type="radio"
                       name="promo_type"
@@ -3026,7 +3374,7 @@ export default function AdminPage() {
                 </div>
                 {newAnnouncement.promo_type === 'card' && (
                   <div className="mb-2">
-                    <label className="block text-[11px] text-gray-400 mb-1">
+                    <label className="block text-sm text-gray-400 mb-1">
                       Optional card image (shown behind title &amp; details on the customer home page)
                     </label>
                     <input
@@ -3038,10 +3386,10 @@ export default function AdminPage() {
                           cardImageFile: e.target.files?.[0] || null,
                         }))
                       }
-                      className="w-full text-xs text-gray-200"
+                      className="w-full text-sm text-gray-200"
                     />
                     {newAnnouncement.cardImageFile ? (
-                      <p className="text-[10px] text-gray-500 mt-1 truncate">
+                      <p className="text-xs text-gray-500 mt-1 truncate">
                         Selected: {newAnnouncement.cardImageFile.name}
                       </p>
                     ) : null}
@@ -3058,7 +3406,7 @@ export default function AdminPage() {
                       ? 'Short heading (optional)'
                       : 'Promo title'
                   }
-                  className="w-full mb-2 px-3 py-2 border border-yellow-500/40 rounded-lg text-sm bg-black text-white"
+                  className="w-full mb-2 px-3 py-2 border border-yellow-500/40 rounded-lg text-base bg-black text-white"
                 />
                 <textarea
                   value={newAnnouncement.content}
@@ -3071,12 +3419,12 @@ export default function AdminPage() {
                       : 'Full promo details'
                   }
                   rows={4}
-                  className="w-full mb-3 px-3 py-2 border border-yellow-500/40 rounded-lg text-sm bg-black text-white"
+                  className="w-full mb-3 px-3 py-2 border border-yellow-500/40 rounded-lg text-base bg-black text-white"
                 />
                 <button
                   type="button"
                   onClick={createAnnouncement}
-                  className="w-full bg-yellow-400 text-black py-2 rounded-lg text-sm font-semibold hover:bg-yellow-300 transition-all"
+                  className="w-full bg-yellow-400 text-black py-2 rounded-lg text-base font-semibold hover:bg-yellow-300 transition-all"
                 >
                   Post promo
                 </button>
@@ -3101,7 +3449,7 @@ export default function AdminPage() {
                         <div>
                           <div className="flex flex-wrap items-center gap-2 mb-1">
                             <span
-                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide border ${
+                              className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold uppercase tracking-wide border ${
                                 a.promo_type === 'marquee'
                                   ? 'bg-amber-500/15 text-amber-200 border-amber-500/35'
                                   : 'bg-yellow-500/15 text-yellow-200 border-yellow-500/35'
@@ -3121,15 +3469,15 @@ export default function AdminPage() {
                                 type="button"
                                 onClick={() => removeAnnouncementCardImage(a)}
                                 disabled={removingCardImageId === a.id}
-                                className="px-2 py-1 rounded-md text-[11px] font-semibold bg-neutral-800 text-amber-200 border border-yellow-500/30 hover:bg-neutral-700 disabled:opacity-50"
+                                className="px-2 py-1 rounded-md text-sm font-semibold bg-neutral-800 text-amber-200 border border-yellow-500/30 hover:bg-neutral-700 disabled:opacity-50"
                               >
                                 {removingCardImageId === a.id ? 'Removing…' : 'Delete image'}
                               </button>
                             </div>
                           ) : null}
-                          <p className="font-semibold text-yellow-300">{a.title}</p>
-                          <p className="text-sm text-gray-200">{a.content}</p>
-                          <p className="text-xs text-gray-500 mt-1">
+                          <p className="text-base font-semibold text-yellow-300">{a.title}</p>
+                          <p className="text-base text-gray-200">{a.content}</p>
+                          <p className="text-sm text-gray-500 mt-1">
                             {new Date(a.created_at).toLocaleString()}
                           </p>
                         </div>
@@ -3137,7 +3485,7 @@ export default function AdminPage() {
                           <div className="flex flex-wrap items-center justify-end gap-3">
                             <div className="flex items-center gap-2">
                               <span
-                                className={`text-[10px] font-extrabold uppercase tracking-wide ${
+                                className={`text-xs font-extrabold uppercase tracking-wide ${
                                   a.active ? 'text-gray-600' : 'text-yellow-300'
                                 }`}
                               >
@@ -3160,7 +3508,7 @@ export default function AdminPage() {
                                 />
                               </button>
                               <span
-                                className={`text-[10px] font-extrabold uppercase tracking-wide ${
+                                className={`text-xs font-extrabold uppercase tracking-wide ${
                                   a.active ? 'text-green-300' : 'text-gray-600'
                                 }`}
                               >
@@ -3170,12 +3518,12 @@ export default function AdminPage() {
                             <button
                               type="button"
                               onClick={() => deleteAnnouncement(a)}
-                              className="px-3 py-1 rounded-full text-xs font-semibold whitespace-nowrap bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
+                              className="px-3 py-1 rounded-full text-sm font-semibold whitespace-nowrap bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
                             >
                               Delete
                             </button>
                           </div>
-                          <p className="text-[10px] text-gray-500 text-right max-w-[14rem] leading-tight">
+                          <p className="text-xs text-gray-500 text-right max-w-[14rem] leading-tight">
                             {a.active ? 'Visible on site' : 'Hidden from site'}
                           </p>
                         </div>

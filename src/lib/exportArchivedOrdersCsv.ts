@@ -81,6 +81,61 @@ ${bodyRows.join('\n')}
 </html>`;
 }
 
+/**
+ * Excel-friendly HTML table for sales reports (one row per order; products listed in one cell).
+ * Used by SalesReportsPanel (Online vs POS walk-in monitoring).
+ */
+export function buildSalesReportExcelHtml(orders: OrderWithItems[]): string {
+  const headers = [
+    'Order number',
+    'Date & time (placed)',
+    'Channel',
+    'Payment method',
+    'Products (name × qty)',
+    'Order total (PHP)',
+  ];
+
+  const headerRow = `<tr>${headers
+    .map((h, i) => {
+      const align = i === headers.length - 1 ? ' style="text-align:center;font-weight:bold"' : ' style="font-weight:bold"';
+      return `<th${align}>${escapeHtml(h)}</th>`;
+    })
+    .join('')}</tr>`;
+
+  const bodyRows: string[] = [];
+
+  for (const order of orders) {
+    const orderNum = escapeHtml(order.id.slice(0, 8));
+    const placed = escapeHtml(formatPlacedDateTime(order.created_at));
+    const channel = (order.order_channel || 'online') === 'pos' ? 'POS (Walk-in)' : 'Online Order';
+    const payment = order.payment_method ?? '';
+    const total = (order.final_amount ?? 0).toFixed(2);
+    const items = order.order_items?.length ? order.order_items : [];
+    const productsHtml = formatProductsLinesHtml(items);
+
+    bodyRows.push(
+      `<tr><td>${orderNum}</td><td>${placed}</td><td>${escapeHtml(channel)}</td><td>${escapeHtml(payment)}</td><td style="vertical-align:top">${productsHtml || '&nbsp;'}</td><td style="text-align:center">${escapeHtml(total)}</td></tr>`
+    );
+  }
+
+  return `<!DOCTYPE html>
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel">
+<head>
+<meta charset="utf-8">
+<meta name="ExcelCreated" content="1">
+<!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>Sales report</x:Name></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]-->
+</head>
+<body>
+<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:11pt">
+<thead>${headerRow}</thead>
+<tbody>
+${bodyRows.join('\n')}
+</tbody>
+</table>
+</body>
+</html>`;
+}
+
 export function downloadArchivedOrdersExcel(html: string, filename: string): void {
   const blob = new Blob([html], { type: 'application/vnd.ms-excel;charset=utf-8' });
   const url = URL.createObjectURL(blob);
