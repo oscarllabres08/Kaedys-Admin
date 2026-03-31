@@ -265,6 +265,8 @@ export default function AdminPage() {
   const [activityLogs, setActivityLogs] = useState<AdminActivityLog[]>([]);
   const [activityLoading, setActivityLoading] = useState(false);
   const isMasterAdmin = !!adminProfile?.is_master_admin;
+  const [activityOlderOpen, setActivityOlderOpen] = useState(false);
+  const [activityMonthOpen, setActivityMonthOpen] = useState<Record<string, boolean>>({});
 
   const logActivity = useCallback(
     (input: LogAdminActivityInput) => {
@@ -618,6 +620,32 @@ export default function AdminPage() {
       setActivityLoading(false);
     }
   }, []);
+
+  const toggleActivityMonth = (key: string) => {
+    setActivityMonthOpen((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const fmtMonthLabel = (monthKey: string) => {
+    const [y, m] = monthKey.split('-').map((v) => Number(v));
+    const d = new Date(y, Math.max(0, (m || 1) - 1), 1);
+    return d.toLocaleString(undefined, { month: 'long', year: 'numeric' });
+  };
+
+  const activityNow = Date.now();
+  const activityCutoffMs = 7 * 24 * 60 * 60 * 1000;
+  const activityCutoff = activityNow - activityCutoffMs;
+  const recentActivity = activityLogs.filter((r) => new Date(r.created_at).getTime() >= activityCutoff);
+  const olderActivity = activityLogs.filter((r) => new Date(r.created_at).getTime() < activityCutoff);
+  const olderByMonth = olderActivity.reduce(
+    (acc, row) => {
+      const d = new Date(row.created_at);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      (acc[key] ||= []).push(row);
+      return acc;
+    },
+    {} as Record<string, AdminActivityLog[]>
+  );
+  const olderMonthKeys = Object.keys(olderByMonth).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
 
   const fetchMenuItems = async () => {
     setMenuLoading(true);
@@ -1557,10 +1585,10 @@ export default function AdminPage() {
       if (error) throw error;
       await fetchGameSettings();
       logActivity({
-        action: 'game.falling_pizza_toggled',
+        action: 'game.math_challenge_toggled',
         resourceType: 'game_settings',
         resourceId: gameSettings.id,
-        summary: `Discount game (falling pizza) ${!(gameSettings.falling_pizza_active ?? gameSettings.is_active) ? 'ON' : 'OFF'}`,
+        summary: `Math Challenge game ${!(gameSettings.falling_pizza_active ?? gameSettings.is_active) ? 'ON' : 'OFF'}`,
       });
     } catch (error) {
       console.error('Error updating game settings', error);
@@ -3242,7 +3270,7 @@ export default function AdminPage() {
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <button
                         onClick={() => toggleMenuAvailability(item)}
-                        className={`px-2.5 py-1.5 rounded-md text-[11px] font-semibold transition-all ${
+                        className={`px-2 py-1 rounded-md text-[11px] leading-tight font-semibold transition-all ${
                           item.is_available
                             ? 'bg-red-600 text-white hover:bg-red-500'
                             : 'bg-green-600 text-white hover:bg-green-500'
@@ -3274,14 +3302,14 @@ export default function AdminPage() {
                           });
                           setMenuModalOpen(true);
                         }}
-                        className="px-2.5 py-1.5 rounded-md text-[15px] font-semibold bg-yellow-400 text-black hover:bg-yellow-300 transition-all"
+                        className="px-2 py-1 rounded-md text-xs leading-tight font-semibold bg-yellow-400 text-black hover:bg-yellow-300 transition-all"
                       >
                         Edit
                       </button>
                       <button
                         type="button"
                         onClick={() => setDeleteMenuItem(item)}
-                        className="px-2.5 py-1.5 rounded-md text-[13px] font-semibold bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
+                        className="px-2 py-1 rounded-md text-xs leading-tight font-semibold bg-red-500/15 text-red-200 border border-red-500/30 hover:bg-red-500/25 transition-all"
                       >
                         Remove
                       </button>
@@ -4076,13 +4104,45 @@ export default function AdminPage() {
                   </p>
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => void fetchActivityLogs()}
-                className="shrink-0 px-4 py-2.5 rounded-xl border border-yellow-500/35 bg-black/40 text-base font-semibold text-yellow-200 hover:bg-yellow-500/10 transition-colors"
-              >
-                Refresh
-              </button>
+              <div className="shrink-0 flex flex-col sm:flex-row gap-2 sm:items-center">
+                {isMasterAdmin ? (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      const ok = await askConfirm(
+                        'Clear activity log?',
+                        'This will permanently delete ALL admin activity logs. This cannot be undone.',
+                        'Clear all',
+                        'Cancel'
+                      );
+                      if (!ok) return;
+                      try {
+                        const { error } = await supabase.rpc('master_admin_clear_activity_log');
+                        if (error) throw error;
+                        await fetchActivityLogs();
+                      } catch (e) {
+                        console.error('clear activity log', e);
+                        openNoticeModal(
+                          'Clear failed',
+                          'Could not clear activity log. Make sure the migration for master_admin_clear_activity_log is applied.',
+                          'error'
+                        );
+                      }
+                    }}
+                    className="px-4 py-2.5 rounded-xl border border-red-500/35 bg-red-950/30 text-base font-semibold text-red-200 hover:bg-red-500/10 transition-colors"
+                    title="Master admin only"
+                  >
+                    Clear log
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  onClick={() => void fetchActivityLogs()}
+                  className="px-4 py-2.5 rounded-xl border border-yellow-500/35 bg-black/40 text-base font-semibold text-yellow-200 hover:bg-yellow-500/10 transition-colors"
+                >
+                  Refresh
+                </button>
+              </div>
             </div>
 
             {activityLoading ? (
@@ -4095,49 +4155,133 @@ export default function AdminPage() {
                 perform an action (e.g. change an order status) and refresh.
               </p>
             ) : (
-              <div className="overflow-x-auto max-h-[min(70vh,560px)] overflow-y-auto rounded-xl border border-yellow-500/15">
-                <table className="min-w-full text-left text-base">
-                  <thead className="sticky top-0 z-10 bg-neutral-950/95 backdrop-blur-sm border-b border-yellow-500/20 text-sm uppercase tracking-wide text-gray-300">
-                    <tr>
-                      <th className="px-4 py-3 font-semibold whitespace-nowrap">When</th>
-                      <th className="px-4 py-3 font-semibold whitespace-nowrap">Admin</th>
-                      <th className="px-4 py-3 font-semibold whitespace-nowrap">Action</th>
-                      <th className="px-4 py-3 font-semibold min-w-[14rem]">Summary</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-yellow-500/10">
-                    {activityLogs.map((row) => (
-                      <tr key={row.id} className="bg-black/20 hover:bg-black/35 align-top">
-                        <td className="px-4 py-3 text-sm md:text-base text-gray-300 whitespace-nowrap tabular-nums">
-                          {new Date(row.created_at).toLocaleString(undefined, {
-                            year: 'numeric',
-                            month: 'short',
-                            day: 'numeric',
-                            hour: 'numeric',
-                            minute: '2-digit',
-                            second: '2-digit',
-                          })}
-                        </td>
-                        <td className="px-4 py-3 text-gray-200">
-                          <div className="font-semibold text-yellow-100 text-base leading-snug">{row.admin_name}</div>
-                          <div className="text-sm text-gray-400 break-all mt-0.5">{row.admin_email}</div>
-                        </td>
-                        <td className="px-4 py-3 text-sm md:text-base font-medium text-emerald-200">
-                          {formatActivityActionLabel(row.action)}
-                        </td>
-                        <td className="px-4 py-3 text-sm md:text-base text-gray-100 break-words max-w-[28rem] leading-snug">
-                          {row.summary}
-                          {row.resource_id ? (
-                            <span className="block text-xs text-gray-400 mt-1 font-mono break-all">
-                              {row.resource_type ? `${row.resource_type}: ` : ''}
-                              {row.resource_id}
-                            </span>
-                          ) : null}
+              <div className="space-y-3">
+                <div className="overflow-x-auto max-h-[min(70vh,560px)] overflow-y-auto rounded-xl border border-yellow-500/15">
+                  <table className="min-w-full text-left text-base">
+                    <thead className="sticky top-0 z-10 bg-neutral-950/95 backdrop-blur-sm border-b border-yellow-500/20 text-sm uppercase tracking-wide text-gray-300">
+                      <tr>
+                        <th className="px-4 py-3 font-semibold whitespace-nowrap">When</th>
+                        <th className="px-4 py-3 font-semibold whitespace-nowrap">Admin</th>
+                        <th className="px-4 py-3 font-semibold whitespace-nowrap">Action</th>
+                        <th className="px-4 py-3 font-semibold min-w-[14rem]">Summary</th>
+                      </tr>
+                    </thead>
+
+                    <tbody className="divide-y divide-yellow-500/10">
+                      <tr className="bg-black/35">
+                        <td colSpan={4} className="px-4 py-2 text-sm font-semibold text-gray-200">
+                          Recent (last 7 days) <span className="text-gray-400 font-normal">({recentActivity.length})</span>
                         </td>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                      {recentActivity.map((row) => (
+                        <tr key={row.id} className="bg-black/20 hover:bg-black/35 align-top">
+                          <td className="px-4 py-3 text-sm md:text-base text-gray-300 whitespace-nowrap tabular-nums">
+                            {new Date(row.created_at).toLocaleString(undefined, {
+                              year: 'numeric',
+                              month: 'short',
+                              day: 'numeric',
+                              hour: 'numeric',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            })}
+                          </td>
+                          <td className="px-4 py-3 text-gray-200">
+                            <div className="font-semibold text-yellow-100 text-base leading-snug">{row.admin_name}</div>
+                            <div className="text-sm text-gray-400 break-all mt-0.5">{row.admin_email}</div>
+                          </td>
+                          <td className="px-4 py-3 text-sm md:text-base font-medium text-emerald-200">
+                            {formatActivityActionLabel(row.action)}
+                          </td>
+                          <td className="px-4 py-3 text-sm md:text-base text-gray-100 break-words max-w-[28rem] leading-snug">
+                            {row.summary}
+                            {row.resource_id ? (
+                              <span className="block text-xs text-gray-400 mt-1 font-mono break-all">
+                                {row.resource_type ? `${row.resource_type}: ` : ''}
+                                {row.resource_id}
+                              </span>
+                            ) : null}
+                          </td>
+                        </tr>
+                      ))}
+
+                      <tr className="bg-black/35">
+                        <td colSpan={4} className="px-4 py-2">
+                          <button
+                            type="button"
+                            onClick={() => setActivityOlderOpen((v) => !v)}
+                            className="w-full text-left text-sm font-semibold text-gray-200 hover:text-yellow-200 transition-colors"
+                          >
+                            {activityOlderOpen ? '▼' : '▶'} Older than 7 days{' '}
+                            <span className="text-gray-400 font-normal">({olderActivity.length})</span>
+                          </button>
+                        </td>
+                      </tr>
+
+                      {activityOlderOpen ? (
+                        olderMonthKeys.length === 0 ? (
+                          <tr className="bg-black/15">
+                            <td colSpan={4} className="px-4 py-3 text-sm text-gray-400">
+                              No older entries.
+                            </td>
+                          </tr>
+                        ) : (
+                          olderMonthKeys.flatMap((key) => {
+                            const rows = olderByMonth[key] || [];
+                            const open = !!activityMonthOpen[key];
+                            return [
+                              <tr key={`m-${key}`} className="bg-black/25">
+                                <td colSpan={4} className="px-4 py-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleActivityMonth(key)}
+                                    className="w-full text-left text-sm font-semibold text-gray-200 hover:text-yellow-200 transition-colors"
+                                  >
+                                    {open ? '▼' : '▶'} {fmtMonthLabel(key)}{' '}
+                                    <span className="text-gray-400 font-normal">({rows.length})</span>
+                                  </button>
+                                </td>
+                              </tr>,
+                              ...(open
+                                ? rows.map((row) => (
+                                    <tr key={row.id} className="bg-black/15 hover:bg-black/28 align-top">
+                                      <td className="px-4 py-3 text-sm md:text-base text-gray-300 whitespace-nowrap tabular-nums">
+                                        {new Date(row.created_at).toLocaleString(undefined, {
+                                          year: 'numeric',
+                                          month: 'short',
+                                          day: 'numeric',
+                                          hour: 'numeric',
+                                          minute: '2-digit',
+                                          second: '2-digit',
+                                        })}
+                                      </td>
+                                      <td className="px-4 py-3 text-gray-200">
+                                        <div className="font-semibold text-yellow-100 text-base leading-snug">
+                                          {row.admin_name}
+                                        </div>
+                                        <div className="text-sm text-gray-400 break-all mt-0.5">{row.admin_email}</div>
+                                      </td>
+                                      <td className="px-4 py-3 text-sm md:text-base font-medium text-emerald-200">
+                                        {formatActivityActionLabel(row.action)}
+                                      </td>
+                                      <td className="px-4 py-3 text-sm md:text-base text-gray-100 break-words max-w-[28rem] leading-snug">
+                                        {row.summary}
+                                        {row.resource_id ? (
+                                          <span className="block text-xs text-gray-400 mt-1 font-mono break-all">
+                                            {row.resource_type ? `${row.resource_type}: ` : ''}
+                                            {row.resource_id}
+                                          </span>
+                                        ) : null}
+                                      </td>
+                                    </tr>
+                                  ))
+                                : []),
+                            ];
+                          })
+                        )
+                      ) : null}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             )}
           </section>
