@@ -6,6 +6,7 @@ import {
   CustomerProfile,
   GalleryImage,
   GameSettings,
+  MathGameScoreEvent,
   MenuItem,
   Order,
   OrderItem,
@@ -50,6 +51,7 @@ import {
   Store,
   Package,
   TrendingUp,
+  Activity,
 } from 'lucide-react';
 const PosTerminal = lazy(() => import('../components/admin/PosTerminal'));
 const InventoryPanel = lazy(() => import('../components/admin/InventoryPanel'));
@@ -57,6 +59,19 @@ const SalesReportsPanel = lazy(() => import('../components/admin/SalesReportsPan
 
 type OrderWithItems = Order & {
   order_items: OrderItem[];
+};
+
+type GameScoreEventWithProfile = MathGameScoreEvent & {
+  customer_profiles: Pick<
+    CustomerProfile,
+    | 'full_name'
+    | 'username'
+    | 'email'
+    | 'game_score_total'
+    | 'game_score_balance'
+    | 'peso_balance'
+    | 'peso_lifetime_credited'
+  > | null;
 };
 
 type TabId =
@@ -92,6 +107,18 @@ function toTitleCase(value: string) {
     .split(/\s+/)
     .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : ''))
     .join(' ');
+}
+
+function formatMathGameDifficulty(difficulty: string | null | undefined): string {
+  const v = (difficulty ?? '').trim().toLowerCase();
+  if (v === 'easy') return 'Easy';
+  if (v === 'medium') return 'Medium';
+  if (!v) return 'Not recorded';
+  return toTitleCase(String(difficulty).trim());
+}
+
+function fmtPhpAdmin(n: number) {
+  return `₱${Number(n).toFixed(2)}`;
 }
 
 function isTabId(value: string): value is TabId {
@@ -342,6 +369,8 @@ export default function AdminPage() {
 
   const [gameSettings, setGameSettings] = useState<GameSettings | null>(null);
   const [gameLoading, setGameLoading] = useState(false);
+  const [gameScoreEvents, setGameScoreEvents] = useState<GameScoreEventWithProfile[]>([]);
+  const [gameScoreEventsLoading, setGameScoreEventsLoading] = useState(false);
 
   const [paymentSettings, setPaymentSettings] = useState<Record<PaymentMethodSetting['method'], PaymentMethodSetting>>({
     GCash: { method: 'GCash', qr_storage_path: null, account_number: '', account_name: '', updated_at: new Date().toISOString() },
@@ -363,6 +392,7 @@ export default function AdminPage() {
   const [customersById, setCustomersById] = useState<Record<string, CustomerProfile>>({});
   const [posAdminsById, setPosAdminsById] = useState<Record<string, { full_name: string }>>({});
   const [managedUsers, setManagedUsers] = useState<CustomerProfile[]>([]);
+  const [userManagementSearch, setUserManagementSearch] = useState('');
   const [usersLoading, setUsersLoading] = useState(false);
   const [noticeModal, setNoticeModal] = useState<{
     open: boolean;
@@ -424,6 +454,43 @@ export default function AdminPage() {
     }
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [menuItems]);
+
+  /** Group game log by user (newest session first per user; users sorted by latest activity). */
+  const gameScoreEventsByUser = useMemo(() => {
+    const map = new Map<string, GameScoreEventWithProfile[]>();
+    for (const ev of gameScoreEvents) {
+      const cur = map.get(ev.user_id);
+      if (cur) cur.push(ev);
+      else map.set(ev.user_id, [ev]);
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    }
+    return Array.from(map.entries()).sort(([, a], [, b]) => {
+      const ta = new Date(a[0].created_at).getTime();
+      const tb = new Date(b[0].created_at).getTime();
+      return tb - ta;
+    });
+  }, [gameScoreEvents]);
+
+  const filteredManagedUsers = useMemo(() => {
+    const q = userManagementSearch.trim().toLowerCase();
+    if (!q) return managedUsers;
+    return managedUsers.filter((c) => {
+      const haystack = [
+        c.full_name,
+        c.username,
+        c.email,
+        c.phone,
+        c.address ?? '',
+        c.id,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [managedUsers, userManagementSearch]);
 
   const filterCategoryOptions = categoryOptions;
 
@@ -1319,6 +1386,70 @@ export default function AdminPage() {
       setGameLoading(false);
     }
   };
+
+  const fetchGameScoreEvents = useCallback(async () => {
+    setGameScoreEventsLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('math_game_score_events')
+        .select(
+          `
+          id,
+          user_id,
+          created_at,
+          session_points,
+          difficulty,
+          game_score_total_after,
+          game_score_balance_after,
+          customer_profiles (
+            full_name,
+            username,
+            email,
+            game_score_total,
+            game_score_balance,
+            peso_balance,
+            peso_lifetime_credited
+          )
+        `
+        )
+        .order('created_at', { ascending: false })
+        .limit(150);
+
+      if (error) throw error;
+      const raw = (data || []) as Array<Record<string, unknown> & MathGameScoreEvent>;
+      setGameScoreEvents(
+        raw.map((row) => {
+          const cp = row.customer_profiles as GameScoreEventWithProfile['customer_profiles'] | GameScoreEventWithProfile['customer_profiles'][] | undefined;
+          const profile = Array.isArray(cp) ? cp[0] ?? null : cp ?? null;
+          const { customer_profiles: _omit, ...rest } = row;
+          return { ...rest, customer_profiles: profile } as GameScoreEventWithProfile;
+        })
+      );
+    } catch (e) {
+      console.error('Error loading game score events', e);
+      setGameScoreEvents([]);
+    } finally {
+      setGameScoreEventsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'game') return;
+    void fetchGameScoreEvents();
+    const channel = supabase
+      .channel('admin-math-game-score-events')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'math_game_score_events' },
+        () => {
+          void fetchGameScoreEvents();
+        }
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [activeTab, fetchGameScoreEvents]);
 
   const fetchAdmins = async () => {
     setAdminsLoading(true);
@@ -3876,6 +4007,147 @@ export default function AdminPage() {
                 {/* Spin the Wheel game removed */}
               </div>
             )}
+
+            <div className="mt-8 pt-6 border-t border-yellow-500/20">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-cyan-400" />
+                  <h3 className="text-lg font-bold text-yellow-200">Game monitoring</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void fetchGameScoreEvents()}
+                  disabled={gameScoreEventsLoading}
+                  className="px-3 py-2 rounded-lg text-sm font-semibold bg-yellow-500/15 text-yellow-200 border border-yellow-500/35 hover:bg-yellow-500/25 disabled:opacity-50 transition-colors shrink-0"
+                >
+                  {gameScoreEventsLoading ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-400 mb-4">
+                Points earned per finished Math Challenge session (per-row snapshots). Each customer header shows live
+                totals: total points, current points, total wallet balance, and current wallet balance. Tap to expand
+                session history.
+              </p>
+              {gameScoreEventsLoading && gameScoreEvents.length === 0 ? (
+                <div className="flex justify-center py-8">
+                  <Loader2 className="w-6 h-6 text-yellow-400 animate-spin" />
+                </div>
+              ) : gameScoreEvents.length === 0 ? (
+                <p className="text-sm text-gray-400 text-center py-6">No game score activity logged yet.</p>
+              ) : (
+                <div className="space-y-2">
+                  {gameScoreEventsByUser.map(([userId, events]) => {
+                    const latest = events[0];
+                    const cp = latest?.customer_profiles;
+                    const label =
+                      cp?.full_name?.trim() ||
+                      (cp?.username ? `@${cp.username}` : null) ||
+                      cp?.email?.trim() ||
+                      userId.slice(0, 8) + '…';
+                    const sub =
+                      [cp?.username ? `@${cp.username}` : null, cp?.email || null].filter(Boolean).join(' · ') ||
+                      null;
+                    const n = events.length;
+                    const totalPts = cp?.game_score_total ?? 0;
+                    const currentPts = cp?.game_score_balance ?? 0;
+                    const currentPeso = Number(cp?.peso_balance ?? 0);
+                    const totalPesoWallet = Number(cp?.peso_lifetime_credited ?? currentPeso);
+                    return (
+                      <details
+                        key={userId}
+                        className="group rounded-xl border border-yellow-500/25 bg-black/35 open:border-yellow-400/45"
+                      >
+                        <summary className="list-none cursor-pointer px-3 py-3 sm:px-4">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0 flex-1 text-left">
+                              <p className="font-semibold text-yellow-100 truncate">{label}</p>
+                              {sub ? (
+                                <p className="text-xs text-gray-500 truncate">{sub}</p>
+                              ) : (
+                                <p className="text-[11px] text-gray-600 font-mono truncate">{userId}</p>
+                              )}
+                              <p className="text-[11px] text-gray-500 mt-1">
+                                Last: {new Date(latest.created_at).toLocaleString()} ·{' '}
+                                <span className="text-cyan-400/90 font-semibold">{n} session{n === 1 ? '' : 's'}</span>
+                              </p>
+                              {cp ? (
+                                <div className="mt-2.5 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                  <div className="rounded-lg border border-amber-500/25 bg-black/45 px-2 py-1.5">
+                                    <p className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold">
+                                      Total points
+                                    </p>
+                                    <p className="text-sm font-bold text-amber-100 tabular-nums">{totalPts}</p>
+                                  </div>
+                                  <div className="rounded-lg border border-yellow-400/35 bg-black/45 px-2 py-1.5">
+                                    <p className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold">
+                                      Current points
+                                    </p>
+                                    <p className="text-sm font-bold text-yellow-100 tabular-nums">{currentPts}</p>
+                                  </div>
+                                  <div className="rounded-lg border border-teal-500/25 bg-black/45 px-2 py-1.5">
+                                    <p className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold">
+                                      Total wallet balance
+                                    </p>
+                                    <p className="text-sm font-bold text-teal-200 tabular-nums">{fmtPhpAdmin(totalPesoWallet)}</p>
+                                  </div>
+                                  <div className="rounded-lg border border-emerald-500/30 bg-black/45 px-2 py-1.5">
+                                    <p className="text-[9px] uppercase tracking-wide text-gray-500 font-semibold">
+                                      Current wallet balance
+                                    </p>
+                                    <p className="text-sm font-bold text-emerald-300 tabular-nums">{fmtPhpAdmin(currentPeso)}</p>
+                                  </div>
+                                </div>
+                              ) : null}
+                            </div>
+                            <ChevronDown className="w-5 h-5 text-gray-400 shrink-0 transition-transform group-open:rotate-180" />
+                          </div>
+                        </summary>
+                        <div className="px-2 pb-3 sm:px-3 border-t border-yellow-500/15">
+                          <div className="overflow-x-auto pt-3">
+                            <table className="w-full text-left text-sm min-w-[640px]">
+                              <thead>
+                                <tr className="border-b border-yellow-500/20 text-[10px] uppercase tracking-wide text-gray-500">
+                                  <th className="px-2 py-2 font-semibold">Time</th>
+                                  <th className="px-2 py-2 font-semibold text-right">Session pts</th>
+                                  <th className="px-2 py-2 font-semibold">Mode / difficulty</th>
+                                  <th className="px-2 py-2 font-semibold text-right">Total points</th>
+                                  <th className="px-2 py-2 font-semibold text-right">Total discount wallet (current)</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {events.map((ev) => {
+                                  const mode = formatMathGameDifficulty(ev.difficulty);
+                                  return (
+                                    <tr
+                                      key={ev.id}
+                                      className="border-b border-yellow-500/10 text-gray-200 hover:bg-white/[0.03]"
+                                    >
+                                      <td className="px-2 py-2 whitespace-nowrap tabular-nums text-gray-300">
+                                        {new Date(ev.created_at).toLocaleString()}
+                                      </td>
+                                      <td className="px-2 py-2 text-right font-semibold text-cyan-300 tabular-nums">
+                                        +{ev.session_points}
+                                      </td>
+                                      <td className="px-2 py-2 text-gray-300">{mode}</td>
+                                      <td className="px-2 py-2 text-right tabular-nums text-gray-200">
+                                        {ev.game_score_total_after}
+                                      </td>
+                                      <td className="px-2 py-2 text-right tabular-nums text-amber-200/90">
+                                        {ev.game_score_balance_after}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </details>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </section>
         )}
 
@@ -3889,15 +4161,33 @@ export default function AdminPage() {
               Master admin can view full customer details, temporarily suspend accounts, or permanently delete customer accounts.
             </p>
 
+            {!usersLoading && managedUsers.length > 0 ? (
+              <div className="relative mb-4 max-w-md">
+                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500 pointer-events-none" />
+                <input
+                  type="search"
+                  value={userManagementSearch}
+                  onChange={(e) => setUserManagementSearch(e.target.value)}
+                  placeholder="Search name, @username, email, phone, user ID…"
+                  autoComplete="off"
+                  className="w-full rounded-lg border border-yellow-500/25 bg-black/50 py-2.5 pl-10 pr-3 text-sm text-gray-100 placeholder:text-gray-500 focus:border-yellow-400/50 focus:outline-none focus:ring-1 focus:ring-yellow-500/40"
+                />
+              </div>
+            ) : null}
+
             {usersLoading ? (
               <div className="flex justify-center py-8">
                 <Loader2 className="w-6 h-6 text-yellow-400 animate-spin" />
               </div>
             ) : managedUsers.length === 0 ? (
               <p className="text-gray-300 text-center py-6">No customer users found.</p>
+            ) : filteredManagedUsers.length === 0 ? (
+              <p className="text-gray-400 text-center py-6">
+                No users match &quot;{userManagementSearch.trim()}&quot;. Try a different search.
+              </p>
             ) : (
               <div className="space-y-3">
-                {managedUsers.map((customer) => {
+                {filteredManagedUsers.map((customer) => {
                   const suspendedUntil = customer.suspended_until ? new Date(customer.suspended_until) : null;
                   const isSuspended = !!suspendedUntil && suspendedUntil.getTime() > Date.now();
                   return (

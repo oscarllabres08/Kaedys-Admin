@@ -39,6 +39,8 @@ export type CustomerProfile = {
   game_score_balance?: number;
   /** PHP wallet from redeeming points; usable at checkout */
   peso_balance?: number;
+  /** Total PHP ever credited from redeeming points */
+  peso_lifetime_credited?: number;
 };
 
 export type AdminProfile = {
@@ -177,6 +179,17 @@ export type GameSettings = {
   is_active: boolean;
   falling_pizza_active?: boolean | null;
   updated_at: string;
+};
+
+/** Logged when a customer finishes a math game (admin monitoring). */
+export type MathGameScoreEvent = {
+  id: string;
+  user_id: string;
+  created_at: string;
+  session_points: number;
+  difficulty: string | null;
+  game_score_total_after: number;
+  game_score_balance_after: number;
 };
 
 /** Singleton row `id = 1` — official GCash QR object path in Storage bucket `gcash-qr` */
