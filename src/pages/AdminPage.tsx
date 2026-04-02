@@ -1727,7 +1727,31 @@ export default function AdminPage() {
     }
   };
 
-  // Spin the Wheel game removed.
+  const toggleSpinWheelActive = async () => {
+    if (!gameSettings) return;
+    try {
+      const next = !(gameSettings.spin_wheel_active ?? false);
+      const { error } = await supabase
+        .from('game_settings')
+        .update({
+          spin_wheel_active: next,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', gameSettings.id);
+
+      if (error) throw error;
+      await fetchGameSettings();
+      logActivity({
+        action: 'game.spin_wheel_toggled',
+        resourceType: 'game_settings',
+        resourceId: gameSettings.id,
+        summary: `Spin the Wheel game ${next ? 'ON' : 'OFF'}`,
+      });
+    } catch (error) {
+      console.error('Error updating spin wheel settings', error);
+      showDbError('Update failed', error, 'Could not update game settings.');
+    }
+  };
 
   const handleSelectTab = (tab: TabId) => {
     setActiveTab(tab);
@@ -4003,8 +4027,27 @@ export default function AdminPage() {
                     {(gameSettings.falling_pizza_active ?? gameSettings.is_active) ? 'Disable' : 'Enable'}
                   </button>
                 </div>
-
-                {/* Spin the Wheel game removed */}
+                <div className="flex items-center justify-between gap-4 rounded-xl border border-yellow-500/20 bg-black/30 p-3">
+                  <div>
+                    <p className="font-semibold text-gray-200">
+                      Spin the Wheel is{' '}
+                      <span className={(gameSettings.spin_wheel_active ?? false) ? 'text-green-400' : 'text-red-400'}>
+                        {(gameSettings.spin_wheel_active ?? false) ? 'ACTIVE' : 'DISABLED'}
+                      </span>
+                    </p>
+                    <p className="text-xs text-gray-500">Last updated: {new Date(gameSettings.updated_at).toLocaleString()}</p>
+                  </div>
+                  <button
+                    onClick={toggleSpinWheelActive}
+                    className={`px-4 py-2 rounded-lg font-semibold text-sm transition-all ${
+                      (gameSettings.spin_wheel_active ?? false)
+                        ? 'bg-red-500/20 text-red-200 hover:bg-red-500/30'
+                        : 'bg-green-500/20 text-green-200 hover:bg-green-500/30'
+                    }`}
+                  >
+                    {(gameSettings.spin_wheel_active ?? false) ? 'Disable' : 'Enable'}
+                  </button>
+                </div>
               </div>
             )}
 

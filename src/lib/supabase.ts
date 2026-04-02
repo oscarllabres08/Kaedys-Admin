@@ -178,6 +178,7 @@ export type GameSettings = {
   id: string;
   is_active: boolean;
   falling_pizza_active?: boolean | null;
+  spin_wheel_active?: boolean | null;
   updated_at: string;
 };
 
